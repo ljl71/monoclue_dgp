@@ -137,26 +137,27 @@ def checkpoint_model_keys(checkpoint):
 
 
 def adapt_monodgp_cfg_to_checkpoint(cfg, checkpoint):
+    model_cfg = cfg["model"] if "model" in cfg else cfg
     keys = checkpoint_model_keys(checkpoint)
     has_fem = any(key.startswith("backbone.0.fem_") for key in keys)
     has_sam_gate = any(key.startswith("depth_predictor.sam_gate.") for key in keys)
     has_se_attention = any(key.startswith("region_head.attention.0.fc1.") for key in keys)
     has_eca_attention = any(key.startswith("region_head.attention.0.conv.") for key in keys)
 
-    cfg["use_fem"] = has_fem
-    cfg["use_sam_gate"] = has_sam_gate
+    model_cfg["use_fem"] = has_fem
+    model_cfg["use_sam_gate"] = has_sam_gate
     if has_se_attention:
-        cfg["region_attention"] = "se"
+        model_cfg["region_attention"] = "se"
     elif has_eca_attention:
-        cfg["region_attention"] = "eca"
+        model_cfg["region_attention"] = "eca"
     else:
-        cfg["region_attention"] = "none"
+        model_cfg["region_attention"] = "none"
 
     print(
         "[INFO] MonoDGP checkpoint-compatible options: "
-        f"use_fem={cfg['use_fem']}, "
-        f"use_sam_gate={cfg['use_sam_gate']}, "
-        f"region_attention={cfg['region_attention']}")
+        f"use_fem={model_cfg['use_fem']}, "
+        f"use_sam_gate={model_cfg['use_sam_gate']}, "
+        f"region_attention={model_cfg['region_attention']}")
 
 
 def build_and_load_model(cfg, checkpoint, device, model_type="monoclue"):
