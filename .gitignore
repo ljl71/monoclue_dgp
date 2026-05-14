@@ -1,0 +1,43 @@
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local IDE/editor files
+.idea/
+.vscode/
+
+# Environment and local config
+.env
+.env.*
+
+# Runtime outputs
+logs/
+outputs/
+checkpoints/
+runs/
+wandb/
+tensorboard/
+*.log
+
+# Datasets and model artifacts
+data/
+datasets/
+*.pth
+*.pt
+*.ckpt
+*.onnx
+*.engine
+
+# OS files
+.DS_Store
+Thumbs.db

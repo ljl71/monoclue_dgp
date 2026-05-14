@@ -1,0 +1,602 @@
+import argparse
+import os
+import sys
+from pathlib import Path
+
+import cv2
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import yaml
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT_DIR = os.path.dirname(BASE_DIR)
+sys.path.append(ROOT_DIR)
+
+from lib.datasets.kitti.kitti_utils import get_objects_from_label
+
+
+MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+PALETTE = np.array([
+    [0, 0, 0],
+    [230, 25, 75],
+    [60, 180, 75],
+    [255, 225, 25],
+    [0, 130, 200],
+    [245, 130, 48],
+    [145, 30, 180],
+    [70, 240, 240],
+    [240, 50, 230],
+    [210, 245, 60],
+    [250, 190, 190],
+    [0, 128, 128],
+    [230, 190, 255],
+    [170, 110, 40],
+    [255, 250, 200],
+], dtype=np.uint8)
+
+
+class PrintLogger:
+    def info(self, message):
+        print(message)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Generate paper visualizations for MonoCLUE-DGP.")
+    parser.add_argument("--config", default="configs/monoclue_dgp_rerun.yaml")
+    parser.add_argument(
+        "--checkpoint",
+        default="/root/autodl-tmp/monoclue_dgp/outputs/monoclue_dgp_rerun/checkpoint_best.pth")
+    parser.add_argument("--output-dir", default="paper_figures/visual_analysis")
+    parser.add_argument("--split", default=None, help="Override dataset.test_split, e.g. val.")
+    parser.add_argument("--sample-ids", default=None,
+                        help="Comma-separated ids, e.g. 000123,000456. If omitted, samples are selected from the split.")
+    parser.add_argument("--num-samples", type=int, default=6)
+    parser.add_argument("--auto-filter", default="all",
+                        choices=["all", "hard", "far", "occluded"],
+                        help="Automatic sample filter when --sample-ids is omitted.")
+    parser.add_argument("--threshold", type=float, default=0.25)
+    parser.add_argument("--topk", type=int, default=50)
+    parser.add_argument("--workers", type=int, default=2)
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--baseline-result-dir", default=None,
+                        help="Optional KITTI-format baseline results folder, e.g. MonoDGP outputs/data.")
+    parser.add_argument("--make", default="all",
+                        help="Comma-separated: all,label,response,prototype,detection,ablation.")
+    return parser.parse_args()
+
+
+def ensure_dir(path):
+    Path(path).mkdir(parents=True, exist_ok=True)
+
+
+def parse_id_set(value):
+    if not value:
+        return None
+    ids = []
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        ids.append(int(item))
+    return set(ids)
+
+
+def image_id_name(img_id):
+    return f"{int(img_id):06d}"
+
+
+def load_cfg(path, args):
+    with open(path, "r") as f:
+        cfg = yaml.load(f, Loader=yaml.Loader)
+    if args.split:
+        cfg["dataset"]["test_split"] = args.split
+    cfg["dataset"]["batch_size"] = 1
+    cfg["dataset"]["load_sam"] = True
+    cfg["dataset"]["random_mixup3d"] = 0.0
+    cfg["tester"]["threshold"] = args.threshold
+    cfg["tester"]["topk"] = args.topk
+    if args.device:
+        cfg["model"]["device"] = args.device
+    return cfg
+
+
+def build_and_load_model(cfg, checkpoint, device):
+    from lib.helpers.model_helper import build_model
+    from lib.helpers.save_helper import load_checkpoint
+
+    model, _ = build_model(cfg["model"])
+    model = model.to(device)
+    load_checkpoint(
+        model=model,
+        optimizer=None,
+        filename=checkpoint,
+        map_location=device,
+        logger=PrintLogger())
+    model.eval()
+    return model
+
+
+def tensor_image_to_rgb(tensor):
+    img = tensor.detach().cpu().numpy().transpose(1, 2, 0)
+    img = np.clip(img * STD + MEAN, 0.0, 1.0)
+    return (img * 255).astype(np.uint8)
+
+
+def resize_float_map(arr, out_hw, interpolation=cv2.INTER_LINEAR):
+    arr = np.asarray(arr, dtype=np.float32)
+    return cv2.resize(arr, (out_hw[1], out_hw[0]), interpolation=interpolation)
+
+
+def normalize_map(arr, valid=None):
+    arr = np.asarray(arr, dtype=np.float32)
+    if valid is None:
+        valid = np.isfinite(arr)
+    if valid.sum() == 0:
+        return np.zeros_like(arr, dtype=np.float32)
+    lo = np.percentile(arr[valid], 2)
+    hi = np.percentile(arr[valid], 98)
+    if hi <= lo:
+        hi = lo + 1e-6
+    return np.clip((arr - lo) / (hi - lo), 0.0, 1.0)
+
+
+def colorize_heat(arr, valid=None, cmap_name="magma"):
+    norm = normalize_map(arr, valid)
+    colored = plt.get_cmap(cmap_name)(norm)[..., :3]
+    colored = (colored * 255).astype(np.uint8)
+    if valid is not None:
+        colored[~valid] = 0
+    return colored
+
+
+def overlay_mask(rgb, mask, color=(255, 80, 30), alpha=0.42):
+    out = rgb.copy()
+    mask = mask.astype(bool)
+    color_arr = np.array(color, dtype=np.float32)
+    out[mask] = np.clip((1 - alpha) * out[mask] + alpha * color_arr, 0, 255)
+    return out.astype(np.uint8)
+
+
+def save_panel(images, titles, out_path, ncols=None, dpi=180):
+    if ncols is None:
+        ncols = len(images)
+    nrows = int(np.ceil(len(images) / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(4.1 * ncols, 2.4 * nrows), dpi=dpi)
+    axes = np.array(axes).reshape(-1)
+    for ax, img, title in zip(axes, images, titles):
+        ax.imshow(img)
+        ax.set_title(title, fontsize=10)
+        ax.axis("off")
+    for ax in axes[len(images):]:
+        ax.axis("off")
+    fig.tight_layout(pad=0.6)
+    fig.savefig(out_path, bbox_inches="tight")
+    plt.close(fig)
+
+
+def masks_to_label_map(masks):
+    masks = np.asarray(masks)
+    if masks.ndim == 4:
+        masks = masks[0]
+    if masks.size == 0 or masks.shape[0] == 0:
+        return np.zeros(masks.shape[-2:] if masks.ndim >= 2 else (1, 1), dtype=np.int32)
+    labels = np.zeros(masks.shape[-2:], dtype=np.int32)
+    for idx, mask in enumerate(masks):
+        labels[mask > 0.5] = idx + 1
+    return labels
+
+
+def colorize_labels(labels):
+    labels = labels.astype(np.int32)
+    colors = PALETTE[labels % len(PALETTE)]
+    colors[labels == 0] = 0
+    return colors
+
+
+def build_box_depth_map(target, hw):
+    boxes = target["boxes_2d"][0].detach().cpu().numpy()
+    depths = target["depth"][0].detach().cpu().numpy().reshape(-1)
+    depth_map = np.zeros(hw, dtype=np.float32)
+    for box, depth in zip(boxes, depths):
+        if depth <= 0:
+            continue
+        x1, y1, x2, y2 = np.round(box).astype(int)
+        x1, x2 = np.clip([x1, x2], 0, hw[1] - 1)
+        y1, y2 = np.clip([y1, y2], 0, hw[0] - 1)
+        if x2 <= x1 or y2 <= y1:
+            continue
+        patch = depth_map[y1:y2, x1:x2]
+        depth_map[y1:y2, x1:x2] = np.where((patch > 0) & (patch < depth), patch, depth)
+    return depth_map
+
+
+def make_label_supervision_figure(inputs, target, out_path):
+    rgb = tensor_image_to_rgb(inputs[0])
+    hw = rgb.shape[:2]
+    box_region = target["obj_region"][0].detach().cpu().numpy().astype(bool)
+    sam_region = target["sam_region"][0].detach().cpu().numpy() > 0.5
+    sam_depth = target["depth_map"][0].detach().cpu().numpy().astype(np.float32)
+    box_depth = build_box_depth_map(target, hw)
+
+    images = [
+        rgb,
+        overlay_mask(rgb, box_region, color=(240, 120, 35)),
+        overlay_mask(rgb, sam_region, color=(30, 180, 90)),
+        colorize_heat(box_depth, valid=box_depth > 0),
+        colorize_heat(sam_depth, valid=sam_depth > 0),
+    ]
+    titles = ["Input", "2D-box region", "SAM-visible region", "2D-box depth label", "SAM depth label"]
+    save_panel(images, titles, out_path)
+
+
+def make_response_figure(inputs, outputs, out_path):
+    rgb = tensor_image_to_rgb(inputs[0])
+    hw = rgb.shape[:2]
+    region_prob = outputs["pred_region_prob"][0][0, 0].detach().cpu().numpy()
+    region_prob = resize_float_map(region_prob, hw)
+
+    if "visual_debug" in outputs and outputs["visual_debug"].get("weighted_depth") is not None:
+        weighted_depth = outputs["visual_debug"]["weighted_depth"][0].detach().cpu().numpy()
+    else:
+        logits = outputs["pred_depth_map_logits"]
+        depth_probs = torch.softmax(logits, dim=1)
+        depth_values = torch.arange(logits.shape[1], device=logits.device, dtype=logits.dtype)
+        weighted_depth = (depth_probs * depth_values.view(1, -1, 1, 1)).sum(1)[0].detach().cpu().numpy()
+    weighted_depth = resize_float_map(weighted_depth, hw)
+    fg_depth = weighted_depth * normalize_map(region_prob)
+
+    images = [
+        rgb,
+        colorize_heat(region_prob, cmap_name="viridis"),
+        colorize_heat(weighted_depth, valid=weighted_depth > 0, cmap_name="magma"),
+        colorize_heat(fg_depth, valid=region_prob > 0.35, cmap_name="magma"),
+        overlay_mask(rgb, region_prob > 0.5, color=(30, 180, 90)),
+    ]
+    titles = ["Input", "Predicted foreground", "Predicted depth response", "Foreground-weighted depth", "Foreground overlay"]
+    save_panel(images, titles, out_path)
+
+
+def corr_to_map(corr, spatial_shape):
+    corr = np.asarray(corr)
+    if corr.ndim == 3:
+        corr = corr[0]
+    corr = corr.squeeze(-1)
+    h, w = int(spatial_shape[0]), int(spatial_shape[1])
+    if corr.size != h * w:
+        return np.zeros((h, w), dtype=np.float32)
+    return corr.reshape(h, w).astype(np.float32)
+
+
+def make_prototype_figure(inputs, outputs, out_path):
+    debug = outputs.get("visual_debug", {}).get("query_initializer", None)
+    if not debug or not debug.get("fg_cluster_masks"):
+        return False
+
+    rgb = tensor_image_to_rgb(inputs[0])
+    hw = rgb.shape[:2]
+    spatial_shapes = np.asarray(debug["spatial_shapes"])
+
+    region_prob = outputs["pred_region_prob"][0][0, 0].detach().cpu().numpy()
+    region_prob = resize_float_map(region_prob, hw)
+
+    fg_labels = masks_to_label_map(np.asarray(debug["fg_cluster_masks"][0]))
+    fg_labels = cv2.resize(fg_labels.astype(np.int32), (hw[1], hw[0]), interpolation=cv2.INTER_NEAREST)
+    fg_overlay = overlay_mask(rgb, fg_labels > 0, color=(255, 255, 255), alpha=0.10)
+    fg_colors = colorize_labels(fg_labels)
+    fg_overlay[fg_labels > 0] = np.clip(0.52 * fg_overlay[fg_labels > 0] + 0.48 * fg_colors[fg_labels > 0], 0, 255)
+
+    if debug.get("bg_cluster_masks"):
+        bg_labels = masks_to_label_map(np.asarray(debug["bg_cluster_masks"][0]))
+        bg_labels = cv2.resize(bg_labels.astype(np.int32), (hw[1], hw[0]), interpolation=cv2.INTER_NEAREST)
+        bg_overlay = overlay_mask(rgb, bg_labels > 0, color=(40, 170, 220), alpha=0.45)
+    else:
+        bg_overlay = rgb.copy()
+
+    corr_map = corr_to_map(np.asarray(debug["corr_maps"][0]), spatial_shapes[0])
+    corr_map = resize_float_map(corr_map, hw)
+
+    images = [
+        rgb,
+        colorize_heat(region_prob, cmap_name="viridis"),
+        fg_overlay.astype(np.uint8),
+        bg_overlay,
+        colorize_heat(corr_map, cmap_name="inferno"),
+    ]
+    titles = ["Input", "High-confidence foreground", "Foreground prototypes", "Effective background prototypes", "Prototype similarity"]
+    save_panel(images, titles, out_path)
+    return True
+
+
+def compute_3d_corners(h, w, l, x, y, z, yaw):
+    rot = np.array([
+        [np.cos(yaw), 0, np.sin(yaw)],
+        [0, 1, 0],
+        [-np.sin(yaw), 0, np.cos(yaw)],
+    ])
+    x_c = np.array([l / 2, l / 2, -l / 2, -l / 2, l / 2, l / 2, -l / 2, -l / 2])
+    y_c = np.array([0, 0, 0, 0, -h, -h, -h, -h])
+    z_c = np.array([w / 2, -w / 2, -w / 2, w / 2, w / 2, -w / 2, -w / 2, w / 2])
+    corners = rot @ np.vstack([x_c, y_c, z_c])
+    corners += np.array([[x], [y], [z]])
+    return corners.T
+
+
+def draw_projected_box(image, pts, color, thickness=2):
+    pts = np.asarray(pts, dtype=np.int32)
+    edges = [(0, 1), (1, 2), (2, 3), (3, 0), (4, 5), (5, 6), (6, 7), (7, 4),
+             (0, 4), (1, 5), (2, 6), (3, 7)]
+    for i, j in edges:
+        cv2.line(image, tuple(pts[i]), tuple(pts[j]), color, thickness, lineType=cv2.LINE_AA)
+    return image
+
+
+def draw_objects_on_image(rgb, calib, gt_objects, pred_objects, baseline_objects=None):
+    out = rgb.copy()
+    for obj in gt_objects:
+        corners = obj.generate_corners3d()
+        pts = calib.rect_to_img(corners)[0] if hasattr(calib, "rect_to_img") else calib.project_rect_to_image(corners)
+        out = draw_projected_box(out, pts, (60, 220, 60), 2)
+    if baseline_objects:
+        for pred in baseline_objects:
+            corners = compute_3d_corners(*pred["dims"], *pred["loc"], pred["ry"])
+            pts = calib.rect_to_img(corners)[0] if hasattr(calib, "rect_to_img") else calib.project_rect_to_image(corners)
+            out = draw_projected_box(out, pts, (30, 130, 255), 2)
+    for pred in pred_objects:
+        corners = compute_3d_corners(*pred["dims"], *pred["loc"], pred["ry"])
+        pts = calib.rect_to_img(corners)[0] if hasattr(calib, "rect_to_img") else calib.project_rect_to_image(corners)
+        out = draw_projected_box(out, pts, (255, 40, 40), 2)
+    return out
+
+
+def pred_row_to_dict(row):
+    return {
+        "cls_id": int(row[0]),
+        "alpha": float(row[1]),
+        "bbox": [float(x) for x in row[2:6]],
+        "dims": [float(x) for x in row[6:9]],
+        "loc": [float(x) for x in row[9:12]],
+        "ry": float(row[12]),
+        "score": float(row[13]),
+    }
+
+
+def read_baseline_result(result_dir, img_id, class_name="Car", threshold=0.0):
+    if not result_dir:
+        return []
+    path = os.path.join(result_dir, image_id_name(img_id) + ".txt")
+    if not os.path.exists(path):
+        return []
+    preds = []
+    with open(path, "r") as f:
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) < 16 or parts[0] != class_name:
+                continue
+            score = float(parts[15])
+            if score < threshold:
+                continue
+            preds.append({
+                "dims": [float(parts[8]), float(parts[9]), float(parts[10])],
+                "loc": [float(parts[11]), float(parts[12]), float(parts[13])],
+                "ry": float(parts[14]),
+                "score": score,
+            })
+    return preds
+
+
+def draw_bev(ax, gt_objects, pred_objects, baseline_objects=None):
+    def draw_corners(corners, color, label=None, lw=1.8):
+        pts = corners[:4, [0, 2]]
+        pts = np.vstack([pts, pts[0]])
+        ax.plot(pts[:, 0], pts[:, 1], color=color, linewidth=lw, label=label)
+
+    labels = set()
+    for obj in gt_objects:
+        draw_corners(obj.generate_corners3d(), "#38a169", "GT" if "GT" not in labels else None, 2.0)
+        labels.add("GT")
+    if baseline_objects:
+        for pred in baseline_objects:
+            corners = compute_3d_corners(*pred["dims"], *pred["loc"], pred["ry"])
+            draw_corners(corners, "#3182ce", "Baseline" if "Baseline" not in labels else None, 1.5)
+            labels.add("Baseline")
+    for pred in pred_objects:
+        corners = compute_3d_corners(*pred["dims"], *pred["loc"], pred["ry"])
+        draw_corners(corners, "#e53e3e", "Ours" if "Ours" not in labels else None, 1.8)
+        labels.add("Ours")
+
+    ax.set_xlim(-20, 20)
+    ax.set_ylim(0, 80)
+    ax.set_aspect("equal", adjustable="box")
+    ax.grid(True, linestyle="--", linewidth=0.4, alpha=0.45)
+    ax.set_xlabel("x / m")
+    ax.set_ylabel("z / m")
+    if labels:
+        ax.legend(loc="upper right", fontsize=8)
+
+
+def make_detection_figure(dataset, inputs, outputs, info, out_path, threshold, topk, baseline_result_dir=None):
+    from lib.helpers.decode_helper import decode_detections, extract_dets_from_outputs
+
+    img_id = int(info["img_id"][0].detach().cpu().item())
+    img_name = image_id_name(img_id)
+    img_path = os.path.join(dataset.image_dir, img_name + dataset.image_ext)
+    rgb = cv2.cvtColor(cv2.imread(img_path), cv2.COLOR_BGR2RGB)
+
+    dets = extract_dets_from_outputs(outputs=outputs, K=dataset.max_objs, topk=topk).detach().cpu().numpy()
+    info_np = {key: val.detach().cpu().numpy() for key, val in info.items()}
+    calibs = [dataset.get_calib(img_id)]
+    decoded = decode_detections(dets, info_np, calibs, dataset.cls_mean_size, threshold=threshold)
+    pred_objects = [pred_row_to_dict(row) for row in decoded.get(img_id, []) if int(row[0]) == dataset.cls2id.get("Car", 1)]
+
+    gt_path = os.path.join(dataset.label_dir, img_name + ".txt")
+    gt_objects = [
+        obj for obj in get_objects_from_label(gt_path)
+        if obj.cls_type == "Car" and obj.level_str != "DontCare"
+    ]
+    baseline_objects = read_baseline_result(baseline_result_dir, img_id, threshold=threshold)
+    drawn = draw_objects_on_image(rgb, calibs[0], gt_objects, pred_objects, baseline_objects)
+
+    fig = plt.figure(figsize=(13, 4.8), dpi=180)
+    ax1 = fig.add_subplot(1, 2, 1)
+    ax1.imshow(drawn)
+    ax1.set_title("Image-view 3D boxes")
+    ax1.axis("off")
+    ax2 = fig.add_subplot(1, 2, 2)
+    draw_bev(ax2, gt_objects, pred_objects, baseline_objects)
+    ax2.set_title("BEV localization")
+    fig.tight_layout()
+    fig.savefig(out_path, bbox_inches="tight")
+    plt.close(fig)
+
+
+def sample_matches_filter(dataset, img_id, mode):
+    if mode == "all":
+        return True
+    label_path = os.path.join(dataset.label_dir, image_id_name(img_id) + ".txt")
+    if not os.path.exists(label_path):
+        return False
+    objects = [obj for obj in get_objects_from_label(label_path) if obj.cls_type == "Car"]
+    if mode == "far":
+        return any(obj.pos[2] >= 35 for obj in objects)
+    if mode == "occluded":
+        return any(obj.occlusion >= 1 for obj in objects)
+    if mode == "hard":
+        return any(obj.level_str == "Hard" or obj.pos[2] >= 35 or obj.occlusion >= 1 or obj.trucation > 0.1
+                   for obj in objects)
+    return True
+
+
+def plot_ablation_summary(out_path):
+    main = {
+        "A": [28.62, 21.09, 18.80],
+        "B": [29.86, 21.61, 19.47],
+        "C": [30.43, 22.51, 19.39],
+        "D": [30.51, 22.03, 19.87],
+        "E": [31.33, 22.60, 20.33],
+    }
+    proto = {
+        "None": [30.51, 22.03, 19.87],
+        "FG": [30.72, 22.20, 19.76],
+        "FG+BG": [30.95, 22.31, 19.92],
+        "FG+BG+Mem": [31.08, 22.42, 20.05],
+        "Full": [31.33, 22.60, 20.33],
+    }
+    nums = {
+        "5": [30.48, 21.51, 19.52],
+        "10": [31.33, 22.60, 20.33],
+        "15": [30.36, 21.56, 18.99],
+    }
+    series = [("Easy", 0, "#386cb0"), ("Mod.", 1, "#2e8b57"), ("Hard", 2, "#a64e4e")]
+
+    fig, axes = plt.subplots(1, 3, figsize=(15.5, 4.0), dpi=180)
+    for ax, data, title, xlabel in [
+        (axes[0], main, "(a) Main module ablation", "Experiment ID"),
+        (axes[1], proto, "(b) Prototype components", "Component setting"),
+        (axes[2], nums, "(c) Prototype number sensitivity", "Foreground prototypes"),
+    ]:
+        keys = list(data.keys())
+        x = np.arange(len(keys))
+        for name, idx, color in series:
+            ax.plot(x, [data[k][idx] for k in keys], marker="o", linewidth=2.0, color=color, label=name)
+        ax.set_xticks(x)
+        ax.set_xticklabels(keys, rotation=15 if len(keys) > 3 else 0)
+        ax.set_title(title)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(r"$AP_{3D}$ (%)")
+        ax.grid(axis="y", linestyle="--", alpha=0.4)
+    axes[0].legend(loc="lower right", ncol=3, fontsize=8)
+    fig.tight_layout()
+    fig.savefig(out_path, bbox_inches="tight")
+    plt.close(fig)
+
+
+def main():
+    args = parse_args()
+    make_set = set(["label", "response", "prototype", "detection", "ablation"]
+                   if args.make == "all" else [x.strip() for x in args.make.split(",") if x.strip()])
+
+    cfg = load_cfg(args.config, args)
+    output_dir = Path(args.output_dir)
+    subdirs = {
+        "label": output_dir / "01_label_supervision",
+        "response": output_dir / "02_response_maps",
+        "prototype": output_dir / "03_prototype_relocalization",
+        "detection": output_dir / "04_detection_bev",
+        "ablation": output_dir / "05_ablation_summary",
+    }
+    for key in make_set:
+        ensure_dir(subdirs[key])
+
+    model_needed = bool(make_set & {"label", "response", "prototype", "detection"})
+    if model_needed:
+        import torch
+        from lib.helpers.dataloader_helper import build_test_dataloader
+
+        device = torch.device(args.device if torch.cuda.is_available() and args.device.startswith("cuda") else "cpu")
+    else:
+        build_test_dataloader = None
+        device = None
+
+    if not model_needed:
+        if "ablation" in make_set:
+            plot_ablation_summary(subdirs["ablation"] / "fig_ablation_summary.png")
+        print(f"Saved figures to {output_dir}")
+        return
+
+    dataloader = build_test_dataloader(cfg["dataset"], workers=args.workers, SAM=True)
+    dataset = dataloader.dataset
+
+    if "ablation" in make_set:
+        plot_ablation_summary(subdirs["ablation"] / "fig_ablation_summary.png")
+
+    model = build_and_load_model(cfg, args.checkpoint, device)
+    sample_ids = parse_id_set(args.sample_ids)
+    saved = 0
+
+    with torch.no_grad():
+        for inputs, calibs, target, info in dataloader:
+            img_id = int(info["img_id"][0].item())
+            if sample_ids is not None:
+                if img_id not in sample_ids:
+                    continue
+            elif not sample_matches_filter(dataset, img_id, args.auto_filter):
+                continue
+
+            inputs_gpu = inputs.to(device)
+            calibs_gpu = calibs.to(device)
+            img_sizes = info["img_size"].to(device)
+            outputs = model(
+                inputs_gpu, calibs_gpu, img_sizes,
+                dn_args=0, return_visual_debug=("prototype" in make_set or "response" in make_set))
+
+            name = image_id_name(img_id)
+            if "label" in make_set:
+                make_label_supervision_figure(inputs, target, subdirs["label"] / f"{name}_label_supervision.png")
+            if "response" in make_set:
+                make_response_figure(inputs, outputs, subdirs["response"] / f"{name}_response_maps.png")
+            if "prototype" in make_set:
+                ok = make_prototype_figure(inputs, outputs, subdirs["prototype"] / f"{name}_prototype_relocalization.png")
+                if not ok:
+                    print(f"[WARN] prototype debug data is unavailable for {name}")
+            if "detection" in make_set:
+                make_detection_figure(
+                    dataset, inputs, outputs, info,
+                    subdirs["detection"] / f"{name}_detection_bev.png",
+                    threshold=args.threshold,
+                    topk=args.topk,
+                    baseline_result_dir=args.baseline_result_dir)
+
+            saved += 1
+            print(f"[{saved}] saved visualizations for {name}")
+            if sample_ids is None and saved >= args.num_samples:
+                break
+
+    print(f"Saved {saved} sample(s) to {output_dir}")
+
+
+if __name__ == "__main__":
+    main()

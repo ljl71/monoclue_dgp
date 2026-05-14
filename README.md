@@ -1,0 +1,197 @@
+# MonoCLUE: Object-Aware Clustering Enhances Monocular 3D Object Detection
+
+## Introduction
+This repository provides the official implementation of "MonoCLUE: Object-Aware Clustering Enhances Monocular 3D Object Detection" based on the excellent work [MonoDGP](https://github.com/PuFanqi23/MonoDGP). In this work, we propose a DETR-based monocular 3D detection framework that strengthens visual reasoning by leveraging clustering and scene memory, enabling robust performance under occlusion and limited visibility.
+
+<p align="center">
+    <a href="https://arxiv.org/abs/2511.07862"><img src="https://img.shields.io/badge/MonoCLUE-arXiv-red.svg"></a>
+    <a href="http://www.cvlibs.net/datasets/kitti/eval_object.php?obj_benchmark=3d"><img src="https://img.shields.io/badge/KITTI-dataset-green.svg"></a>
+</p>
+
+
+
+<div align="center"> <img src="figures/overall_architecture.png" width="600" height="auto"/> </div> 
+
+<div align="center"> <img src="figures/explanation.png" width="600" height="auto"/> </div>
+
+## Demo
+
+### Scene 1
+<p align="center">
+  <img src="figures/sample1.gif" width="600"/>
+</p>
+
+### Scene 2
+<p align="center">
+  <img src="figures/sample2.gif" width="600"/>
+</p>
+
+
+
+## Main Result
+
+Note that the randomness of training for monocular detection would cause a variance of ±1 AP<sub>3D|R40</sub> on KITTI.
+
+The official results :
+<table>
+    <tr>
+        <td rowspan="2",div align="center">Models</td>
+        <td colspan="3",div align="center">Val, AP<sub>3D|R40</sub></td>   
+        <td rowspan="2",div align="center">Logs</td>
+        <td rowspan="2",div align="center">Ckpts</td>
+    </tr>
+    <tr>
+        <td div align="center">Easy</td> 
+        <td div align="center">Mod.</td> 
+        <td div align="center">Hard</td> 
+    </tr>
+    <tr>
+        <td rowspan="4",div align="center">MonoCLUE</td>
+        <td div align="center">33.7426%</td> 
+        <td div align="center">24.1090%</td> 
+        <td div align="center">20.5883%</td> 
+        <td div align="center"><a href="https://drive.google.com/file/d/1G51qlnwXMSD5zgRlXPCjkAjBWMlqbjdg/view?usp=drive_link">log</a></td>
+        <td div align="center"><a href="https://drive.google.com/file/d/183zRv7EaR3ReS4QA9KTfLPbRRxwjHcqU/view?usp=sharing">ckpt</a></td>
+    </tr>  
+  <tr> 
+        <td div align="center">31.5802%</td> 
+        <td div align="center">23.5648%</td> 
+        <td div align="center">20.2746%</td> 
+        <td div align="center"><a href="https://drive.google.com/file/d/1bTqH3DCnN-PSjchHDX0yG52xsAdMCFPy/view?usp=drive_link">log</a></td>
+        <td div align="center"><a href="https://drive.google.com/file/d/1Sa1J2m0dp0a34ILvWt7YMFl1jJHprDbC/view?usp=drive_link">ckpt</a></td>
+    </tr>  
+</table>
+
+The test result :
+
+<div> <img src="figures/test_result.png" width="400" height="auto"/> </div>
+
+
+## Installation
+1. Clone this project and create a conda environment:
+    ```
+    git clone https://github.com/SungHunYang/MonoCLUE.git
+    cd MonoCLUE
+
+    conda create -n monoclue python=3.8
+    conda activate monoclue
+    ```
+    
+2. Install pytorch and torchvision matching your CUDA version:
+    ```bash
+    pip install torch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1 --index-url https://download.pytorch.org/whl/cu121
+    ```
+    
+3. Install requirements and compile the deformable attention:
+    ```
+    pip install -r requirements.txt
+
+    cd lib/models/monoclue/ops/
+    bash make.sh
+    
+    cd ../../../..
+    ```
+ 
+4. Download KITTI datasets and prepare the directory structure as:
+    ```
+    │MonoCLUE/
+    ├──...
+    │data/kitti/
+    ├──ImageSets/
+    ├──training/
+    │   ├──image_2
+    │   ├──label_2
+    │   ├──calib
+    ├──testing/
+    │   ├──image_2
+    │   ├──calib
+    ```
+    Note that if you need the Waymo dataset, please follow [DEVIANT](https://github.com/abhi1kumar/DEVIANT) 
+    
+5. Download sam_vit_h.pth from the [SAM](https://github.com/facebookresearch/segment-anything) repository and prepare the SAM-guided dataset.
+    ```
+    python make_sam.py
+    ```
+    **Important:** Before generating the SAM-guided dataset, please set `self.data_augmentation = False` in `kitti_dataset.py`, and set `batch_size = 1` in `monoclue.yaml`.  
+    Otherwise, the generated SAM labels may be misaligned.
+   
+    Note that if you run it with all_category, a folder named "label_sam_all" should be created.
+   
+7. Finally, prepare the directory structure as:
+    ```   
+    │MonoCLUE/
+    ├──...
+    │data/kitti/
+    ├──ImageSets/
+    ├──training/
+    │   ├──image_2
+    │   ├──label_2
+    │   ├──calib
+    |   ├──label_sam/
+    |        ├──region
+    |        └──depth
+    ├──testing/
+    │   ├──image_2
+    │   ├──calib
+    ```
+    
+    You can also change the data path at "dataset/root_dir" in `configs/monoclue.yaml`.
+    
+## Get Started
+
+### Train
+You can modify the settings of models and training in `configs/monoclue.yaml` and indicate the GPU in `train.sh`:
+    
+    bash train.sh configs/monoclue.yaml > logs/monoclue.log
+    
+### Test
+The best checkpoint will be evaluated as default. You must ensure that the checkpoint is located in `outputs/monoclue/`:
+    
+    bash test.sh configs/monoclue.yaml
+
+
+### Visualize
+1. After testing, prepare the directory structure as follows:
+    ```
+    │MonoCLUE/
+    ├──outputs/
+    │   ├──monoclue/
+    │       ├──outputs/
+    │           ├──data/
+    │               ├──000001.txt
+    │               ├──000002.txt
+    │               ├──000003.txt
+    │               ├──000004.txt
+    ```
+    
+2. Navigate to the visualization folder:
+    ```bash
+    cd visualize
+    ```
+3. Run the visualization script:
+    ```bash
+    
+    python draw3D_bbox.py
+
+    # With detailed information
+    python draw3D_bbox.py --print_info True
+    ```
+    
+Note that if you need LiDAR visualization, please follow [kitti_object_vis](https://github.com/kuixu/kitti_object_vis) repository 
+
+## Citation
+Please cite this work if you find it useful:
+```BibTex
+@inproceedings{yang2026monoclue,
+  title={MonoCLUE: Object-Aware Clustering Enhances Monocular 3D Object Detection},
+  author={Yang, Sunghun and Lee, Minhyeok and Lee, Jungho and Lee, Sangyoun},
+  booktitle={Proceedings of the AAAI Conference on Artificial Intelligence},
+  volume={40},
+  number={14},
+  pages={11721--11729},
+  year={2026}
+}
+```
+
+## Acknowlegment
+This repo benefits from the excellent [MonoDETR](https://github.com/ZrrSkywalker/MonoDETR) / [MonoDGP](https://github.com/PuFanqi23/MonoDGPand).
