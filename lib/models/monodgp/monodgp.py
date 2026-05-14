@@ -30,7 +30,8 @@ class MonoDGP(nn.Module):
 
     def __init__(self, backbone, depth_predictor, det2d_transformer, det3d_transformer,
                  num_classes, num_queries, num_feature_levels,
-                 aux_loss=True, with_box_refine=False, init_box=False, group_num=11):
+                 aux_loss=True, with_box_refine=False, init_box=False, group_num=11,
+                 region_attention="eca"):
         """ Initializes the model.
         Parameters:
             backbone: torch module of the backbone to be used. See backbone.py
@@ -51,7 +52,7 @@ class MonoDGP(nn.Module):
         hidden_dim = det2d_transformer.d_model
         self.hidden_dim = hidden_dim
 
-        self.region_head = RegionSegHead(d_model=hidden_dim)
+        self.region_head = RegionSegHead(d_model=hidden_dim, attention_type=region_attention)
 
         self.num_feature_levels = num_feature_levels
 
@@ -630,7 +631,8 @@ def build(cfg):
         num_feature_levels=cfg['num_feature_levels'],
         with_box_refine=cfg['with_box_refine'],
         init_box=cfg['init_box'],
-        group_num=cfg['group_num'])
+        group_num=cfg['group_num'],
+        region_attention=cfg.get('region_attention', 'eca'))
 
     # matcher
     matcher = build_matcher(cfg)

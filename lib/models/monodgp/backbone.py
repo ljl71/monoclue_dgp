@@ -97,7 +97,8 @@ class Backbone(BackboneBase):
     def __init__(self, name: str,
                  train_backbone: bool,
                  return_interm_layers: bool,
-                 dilation: bool):
+                 dilation: bool,
+                 use_fem: bool = True):
         norm_layer = FrozenBatchNorm2d
         backbone = getattr(torchvision.models, name)(
             replace_stride_with_dilation=[False, False, dilation],
@@ -107,26 +108,25 @@ class Backbone(BackboneBase):
         if dilation:
             self.strides[-1] = self.strides[-1] // 2
 
-        # ✅ FEM 模块
-        self.fem_c3 = FEM(512)
-        self.fem_c4 = FEM(1024)
-        self.fem_c5 = FEM(2048)
+        self.use_fem = use_fem
+        if self.use_fem:
+            self.fem_c3 = FEM(512)
+            self.fem_c4 = FEM(1024)
+            self.fem_c5 = FEM(2048)
 
-    # ✅ 重写 forward，真正调用 FEM
     def forward(self, images):
         xs = self.body(images)
         out = {}
         for name, x in xs.items():
-            if name == "layer2":
+            if self.use_fem and name == "layer2":
                 x = self.fem_c3(x)
-            elif name == "layer3":
+            elif self.use_fem and name == "layer3":
                 x = self.fem_c4(x)
-            elif name == "layer4":
+            elif self.use_fem and name == "layer4":
                 x = self.fem_c5(x)
 
             m = torch.zeros(x.shape[0], x.shape[2], x.shape[3]).to(torch.bool).to(x.device)
             out[name] = NestedTensor(x, m)
-        # print("✅ FEM applied to", name)
         return out
 
 
@@ -153,6 +153,11 @@ class Joiner(nn.Sequential):
 def build_backbone(cfg):
     position_embedding = build_position_encoding(cfg)
     return_interm_layers = cfg['masks'] or cfg['num_feature_levels'] > 1
-    backbone = Backbone(cfg['backbone'], cfg['train_backbone'], return_interm_layers, cfg['dilation'])
+    backbone = Backbone(
+        cfg['backbone'],
+        cfg['train_backbone'],
+        return_interm_layers,
+        cfg['dilation'],
+        use_fem=cfg.get('use_fem', True))
     model = Joiner(backbone, position_embedding)
     return model

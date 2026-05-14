@@ -130,8 +130,40 @@ def build_model_by_type(cfg, model_type):
     raise ValueError(f"Unsupported model type: {model_type}")
 
 
+def checkpoint_model_keys(checkpoint):
+    checkpoint_data = torch.load(checkpoint, map_location="cpu")
+    state = checkpoint_data.get("model_state", checkpoint_data)
+    return set(state.keys())
+
+
+def adapt_monodgp_cfg_to_checkpoint(cfg, checkpoint):
+    keys = checkpoint_model_keys(checkpoint)
+    has_fem = any(key.startswith("backbone.0.fem_") for key in keys)
+    has_sam_gate = any(key.startswith("depth_predictor.sam_gate.") for key in keys)
+    has_se_attention = any(key.startswith("region_head.attention.0.fc1.") for key in keys)
+    has_eca_attention = any(key.startswith("region_head.attention.0.conv.") for key in keys)
+
+    cfg["use_fem"] = has_fem
+    cfg["use_sam_gate"] = has_sam_gate
+    if has_se_attention:
+        cfg["region_attention"] = "se"
+    elif has_eca_attention:
+        cfg["region_attention"] = "eca"
+    else:
+        cfg["region_attention"] = "none"
+
+    print(
+        "[INFO] MonoDGP checkpoint-compatible options: "
+        f"use_fem={cfg['use_fem']}, "
+        f"use_sam_gate={cfg['use_sam_gate']}, "
+        f"region_attention={cfg['region_attention']}")
+
+
 def build_and_load_model(cfg, checkpoint, device, model_type="monoclue"):
     from lib.helpers.save_helper import load_checkpoint
+
+    if model_type == "monodgp":
+        adapt_monodgp_cfg_to_checkpoint(cfg, checkpoint)
 
     model, _ = build_model_by_type(cfg["model"], model_type)
     model = model.to(device)

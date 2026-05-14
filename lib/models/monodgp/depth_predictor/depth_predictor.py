@@ -52,13 +52,14 @@ class DepthPredictor(nn.Module):
 
         self.depth_pos_embed = nn.Embedding(int(self.depth_max) + 1, d_model)
 
-        # SAM掩码门控机制（轻量版）
-        self.sam_gate = nn.Sequential(
-            nn.Conv2d(1, 16, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(16, 1, kernel_size=3, padding=1),
-            nn.Sigmoid()
-        )
+        self.use_sam_gate = model_cfg.get("use_sam_gate", True)
+        if self.use_sam_gate:
+            self.sam_gate = nn.Sequential(
+                nn.Conv2d(1, 16, kernel_size=3, padding=1),
+                nn.ReLU(),
+                nn.Conv2d(16, 1, kernel_size=3, padding=1),
+                nn.Sigmoid()
+            )
 
     def forward(self, feature, mask, pos, sam_mask=None):
         src_16 = self.proj(feature[1])
@@ -67,7 +68,7 @@ class DepthPredictor(nn.Module):
         src = (src_8 + src_16 + src_32) / 3
 
         # 使用 SAM 掩码作为轻量级注意力（平滑融合）
-        if sam_mask is not None:
+        if self.use_sam_gate and sam_mask is not None:
             sam_mask_resized = F.interpolate(
                 sam_mask.unsqueeze(1).float(),
                 size=src.shape[-2:],

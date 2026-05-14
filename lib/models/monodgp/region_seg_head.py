@@ -7,17 +7,17 @@ import math
 from sklearn.cluster import KMeans
 
 
-# class SEBlock(nn.Module):
-#     def __init__(self, channel, reduction=16):
-#         super(SEBlock, self).__init__()
-#         self.fc1 = nn.Conv2d(channel, channel // reduction, kernel_size=1)
-#         self.fc2 = nn.Conv2d(channel // reduction, channel, kernel_size=1)
-#
-#     def forward(self, x):
-#         w = F.adaptive_avg_pool2d(x, 1)
-#         w = F.relu(self.fc1(w))
-#         w = torch.sigmoid(self.fc2(w))
-#         return x * w
+class SEBlock(nn.Module):
+    def __init__(self, channel, reduction=16):
+        super(SEBlock, self).__init__()
+        self.fc1 = nn.Conv2d(channel, channel // reduction, kernel_size=1)
+        self.fc2 = nn.Conv2d(channel // reduction, channel, kernel_size=1)
+
+    def forward(self, x):
+        w = F.adaptive_avg_pool2d(x, 1)
+        w = F.relu(self.fc1(w))
+        w = torch.sigmoid(self.fc2(w))
+        return x * w
 
 
 class ECAModule(nn.Module):
@@ -74,7 +74,7 @@ class EnhancedECAModule(nn.Module):
 
 
 class RegionSegHead(nn.Module):
-    def __init__(self, n_levels=4, d_model=256, num_classes=1):
+    def __init__(self, n_levels=4, d_model=256, num_classes=1, attention_type="eca"):
         super(RegionSegHead, self).__init__()
         input_proj_list = []
         pred_list = []
@@ -92,9 +92,14 @@ class RegionSegHead(nn.Module):
         self.deconv = nn.ModuleList([
             nn.ConvTranspose2d(d_model, d_model, kernel_size=2, stride=2) for _ in range(n_levels - 1)
         ])
-        # self.attention = nn.ModuleList([SEBlock(d_model) for _ in range(n_levels)])
-        # 将SEBlock替换为ECAModule
-        self.attention = nn.ModuleList([ECAModule(d_model) for _ in range(n_levels)])
+        if attention_type == "se":
+            self.attention = nn.ModuleList([SEBlock(d_model) for _ in range(n_levels)])
+        elif attention_type == "eca":
+            self.attention = nn.ModuleList([ECAModule(d_model) for _ in range(n_levels)])
+        elif attention_type in ["none", None]:
+            self.attention = nn.ModuleList([nn.Identity() for _ in range(n_levels)])
+        else:
+            raise ValueError(f"Unsupported region attention type: {attention_type}")
     def forward(self, features):
 
         p = [None] * len(features)
