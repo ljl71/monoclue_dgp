@@ -1,5 +1,6 @@
 import argparse
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -8,6 +9,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+import torch
 import yaml
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -50,6 +52,18 @@ def parse_args():
     parser.add_argument(
         "--checkpoint",
         default="/root/autodl-tmp/monoclue_dgp/outputs/monoclue_dgp_rerun/checkpoint_best.pth")
+    parser.add_argument("--model-type", default="monoclue", choices=["monoclue", "monodgp"],
+                        help="Architecture used by --checkpoint.")
+    parser.add_argument("--method-name", default="MonoCLUE-DGP",
+                        help="Display/output name for --checkpoint.")
+    parser.add_argument("--baseline-checkpoint", default=None,
+                        help="Optional baseline checkpoint. When set, figures are generated for both models.")
+    parser.add_argument("--baseline-config", default=None,
+                        help="Optional config for --baseline-checkpoint. Defaults to --config.")
+    parser.add_argument("--baseline-model-type", default="monodgp", choices=["monoclue", "monodgp"],
+                        help="Architecture used by --baseline-checkpoint.")
+    parser.add_argument("--baseline-name", default="MonoDGP",
+                        help="Display/output name for --baseline-checkpoint.")
     parser.add_argument("--output-dir", default="paper_figures/visual_analysis")
     parser.add_argument("--split", default=None, help="Override dataset.test_split, e.g. val.")
     parser.add_argument("--sample-ids", default=None,
@@ -66,6 +80,8 @@ def parse_args():
                         help="Optional KITTI-format baseline results folder, e.g. MonoDGP outputs/data.")
     parser.add_argument("--make", default="all",
                         help="Comma-separated: all,label,response,prototype,detection,ablation.")
+    parser.add_argument("--panel-mode", default="combined", choices=["combined", "split", "both"],
+                        help="combined: old multi-panel figures; split: each panel as an image; both: save both.")
     return parser.parse_args()
 
 
@@ -104,11 +120,20 @@ def load_cfg(path, args):
     return cfg
 
 
-def build_and_load_model(cfg, checkpoint, device):
-    from lib.helpers.model_helper import build_model
+def build_model_by_type(cfg, model_type):
+    if model_type == "monodgp":
+        from lib.models.monodgp import build_monodgp
+        return build_monodgp(cfg)
+    if model_type == "monoclue":
+        from lib.models.monoclue import build_monoclue
+        return build_monoclue(cfg)
+    raise ValueError(f"Unsupported model type: {model_type}")
+
+
+def build_and_load_model(cfg, checkpoint, device, model_type="monoclue"):
     from lib.helpers.save_helper import load_checkpoint
 
-    model, _ = build_model(cfg["model"])
+    model, _ = build_model_by_type(cfg["model"], model_type)
     model = model.to(device)
     load_checkpoint(
         model=model,
@@ -161,6 +186,27 @@ def overlay_mask(rgb, mask, color=(255, 80, 30), alpha=0.42):
     return out.astype(np.uint8)
 
 
+def slugify(value):
+    value = re.sub(r"[^A-Za-z0-9]+", "_", value.strip().lower())
+    return value.strip("_") or "panel"
+
+
+def safe_dir_name(value):
+    value = re.sub(r"[^A-Za-z0-9_.-]+", "_", value.strip())
+    return value.strip("_") or "model"
+
+
+def save_rgb_image(image, out_path):
+    ensure_dir(Path(out_path).parent)
+    image = np.asarray(image)
+    if image.dtype != np.uint8:
+        image = np.clip(image, 0, 255).astype(np.uint8)
+    if image.ndim == 2:
+        cv2.imwrite(str(out_path), image)
+    else:
+        cv2.imwrite(str(out_path), cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
+
+
 def save_panel(images, titles, out_path, ncols=None, dpi=180):
     if ncols is None:
         ncols = len(images)
@@ -176,6 +222,40 @@ def save_panel(images, titles, out_path, ncols=None, dpi=180):
     fig.tight_layout(pad=0.6)
     fig.savefig(out_path, bbox_inches="tight")
     plt.close(fig)
+
+
+def split_dir_for(out_path):
+    out_path = Path(out_path)
+    return out_path.parent / "split" / out_path.stem
+
+
+def save_figure_outputs(images, titles, out_path, panel_mode="combined", ncols=None, dpi=180):
+    out_path = Path(out_path)
+    if panel_mode in {"combined", "both"}:
+        ensure_dir(out_path.parent)
+        save_panel(images, titles, out_path, ncols=ncols, dpi=dpi)
+    if panel_mode in {"split", "both"}:
+        split_dir = split_dir_for(out_path)
+        ensure_dir(split_dir)
+        for idx, (image, title) in enumerate(zip(images, titles), start=1):
+            save_rgb_image(image, split_dir / f"{out_path.stem}_{idx:02d}_{slugify(title)}.png")
+
+
+def save_side_by_side(images, titles, model_names, out_path, panel_mode="combined", dpi=180):
+    out_path = Path(out_path)
+    ensure_dir(out_path.parent)
+    save_panel(images, model_names, out_path, ncols=len(images), dpi=dpi)
+    if panel_mode == "both":
+        split_dir = split_dir_for(out_path)
+        ensure_dir(split_dir)
+        for image, model_name in zip(images, model_names):
+            save_rgb_image(image, split_dir / f"{out_path.stem}_{safe_dir_name(model_name)}.png")
+
+
+def figure_to_rgb(fig):
+    fig.canvas.draw()
+    rgba = np.asarray(fig.canvas.buffer_rgba())
+    return rgba[..., :3].copy()
 
 
 def masks_to_label_map(masks):
@@ -214,7 +294,7 @@ def build_box_depth_map(target, hw):
     return depth_map
 
 
-def make_label_supervision_figure(inputs, target, out_path):
+def build_label_supervision_images(inputs, target):
     rgb = tensor_image_to_rgb(inputs[0])
     hw = rgb.shape[:2]
     box_region = target["obj_region"][0].detach().cpu().numpy().astype(bool)
@@ -230,10 +310,15 @@ def make_label_supervision_figure(inputs, target, out_path):
         colorize_heat(sam_depth, valid=sam_depth > 0),
     ]
     titles = ["Input", "2D-box region", "SAM-visible region", "2D-box depth label", "SAM depth label"]
-    save_panel(images, titles, out_path)
+    return images, titles
 
 
-def make_response_figure(inputs, outputs, out_path):
+def make_label_supervision_figure(inputs, target, out_path, panel_mode="combined"):
+    images, titles = build_label_supervision_images(inputs, target)
+    save_figure_outputs(images, titles, out_path, panel_mode=panel_mode)
+
+
+def build_response_images(inputs, outputs):
     rgb = tensor_image_to_rgb(inputs[0])
     hw = rgb.shape[:2]
     region_prob = outputs["pred_region_prob"][0][0, 0].detach().cpu().numpy()
@@ -257,7 +342,12 @@ def make_response_figure(inputs, outputs, out_path):
         overlay_mask(rgb, region_prob > 0.5, color=(30, 180, 90)),
     ]
     titles = ["Input", "Predicted foreground", "Predicted depth response", "Foreground-weighted depth", "Foreground overlay"]
-    save_panel(images, titles, out_path)
+    return images, titles
+
+
+def make_response_figure(inputs, outputs, out_path, panel_mode="combined"):
+    images, titles = build_response_images(inputs, outputs)
+    save_figure_outputs(images, titles, out_path, panel_mode=panel_mode)
 
 
 def corr_to_map(corr, spatial_shape):
@@ -271,10 +361,10 @@ def corr_to_map(corr, spatial_shape):
     return corr.reshape(h, w).astype(np.float32)
 
 
-def make_prototype_figure(inputs, outputs, out_path):
+def build_prototype_images(inputs, outputs):
     debug = outputs.get("visual_debug", {}).get("query_initializer", None)
     if not debug or not debug.get("fg_cluster_masks"):
-        return False
+        return None, None
 
     rgb = tensor_image_to_rgb(inputs[0])
     hw = rgb.shape[:2]
@@ -307,7 +397,14 @@ def make_prototype_figure(inputs, outputs, out_path):
         colorize_heat(corr_map, cmap_name="inferno"),
     ]
     titles = ["Input", "High-confidence foreground", "Foreground prototypes", "Effective background prototypes", "Prototype similarity"]
-    save_panel(images, titles, out_path)
+    return images, titles
+
+
+def make_prototype_figure(inputs, outputs, out_path, panel_mode="combined"):
+    images, titles = build_prototype_images(inputs, outputs)
+    if images is None:
+        return False
+    save_figure_outputs(images, titles, out_path, panel_mode=panel_mode)
     return True
 
 
@@ -334,7 +431,8 @@ def draw_projected_box(image, pts, color, thickness=2):
     return image
 
 
-def draw_objects_on_image(rgb, calib, gt_objects, pred_objects, baseline_objects=None):
+def draw_objects_on_image(rgb, calib, gt_objects, pred_objects, baseline_objects=None,
+                          pred_color=(255, 40, 40), baseline_color=(30, 130, 255)):
     out = rgb.copy()
     for obj in gt_objects:
         corners = obj.generate_corners3d()
@@ -344,11 +442,11 @@ def draw_objects_on_image(rgb, calib, gt_objects, pred_objects, baseline_objects
         for pred in baseline_objects:
             corners = compute_3d_corners(*pred["dims"], *pred["loc"], pred["ry"])
             pts = calib.rect_to_img(corners)[0] if hasattr(calib, "rect_to_img") else calib.project_rect_to_image(corners)
-            out = draw_projected_box(out, pts, (30, 130, 255), 2)
+            out = draw_projected_box(out, pts, baseline_color, 2)
     for pred in pred_objects:
         corners = compute_3d_corners(*pred["dims"], *pred["loc"], pred["ry"])
         pts = calib.rect_to_img(corners)[0] if hasattr(calib, "rect_to_img") else calib.project_rect_to_image(corners)
-        out = draw_projected_box(out, pts, (255, 40, 40), 2)
+        out = draw_projected_box(out, pts, pred_color, 2)
     return out
 
 
@@ -388,7 +486,9 @@ def read_baseline_result(result_dir, img_id, class_name="Car", threshold=0.0):
     return preds
 
 
-def draw_bev(ax, gt_objects, pred_objects, baseline_objects=None):
+def draw_bev(ax, gt_objects, pred_objects, baseline_objects=None,
+             pred_label="Ours", baseline_label="Baseline",
+             pred_color="#e53e3e", baseline_color="#3182ce"):
     def draw_corners(corners, color, label=None, lw=1.8):
         pts = corners[:4, [0, 2]]
         pts = np.vstack([pts, pts[0]])
@@ -401,12 +501,12 @@ def draw_bev(ax, gt_objects, pred_objects, baseline_objects=None):
     if baseline_objects:
         for pred in baseline_objects:
             corners = compute_3d_corners(*pred["dims"], *pred["loc"], pred["ry"])
-            draw_corners(corners, "#3182ce", "Baseline" if "Baseline" not in labels else None, 1.5)
-            labels.add("Baseline")
+            draw_corners(corners, baseline_color, baseline_label if baseline_label not in labels else None, 1.5)
+            labels.add(baseline_label)
     for pred in pred_objects:
         corners = compute_3d_corners(*pred["dims"], *pred["loc"], pred["ry"])
-        draw_corners(corners, "#e53e3e", "Ours" if "Ours" not in labels else None, 1.8)
-        labels.add("Ours")
+        draw_corners(corners, pred_color, pred_label if pred_label not in labels else None, 1.8)
+        labels.add(pred_label)
 
     ax.set_xlim(-20, 20)
     ax.set_ylim(0, 80)
@@ -418,39 +518,141 @@ def draw_bev(ax, gt_objects, pred_objects, baseline_objects=None):
         ax.legend(loc="upper right", fontsize=8)
 
 
-def make_detection_figure(dataset, inputs, outputs, info, out_path, threshold, topk, baseline_result_dir=None):
+def decode_pred_objects(dataset, outputs, info, threshold, topk):
     from lib.helpers.decode_helper import decode_detections, extract_dets_from_outputs
 
     img_id = int(info["img_id"][0].detach().cpu().item())
-    img_name = image_id_name(img_id)
-    img_path = os.path.join(dataset.image_dir, img_name + dataset.image_ext)
-    rgb = cv2.cvtColor(cv2.imread(img_path), cv2.COLOR_BGR2RGB)
-
     dets = extract_dets_from_outputs(outputs=outputs, K=dataset.max_objs, topk=topk).detach().cpu().numpy()
     info_np = {key: val.detach().cpu().numpy() for key, val in info.items()}
     calibs = [dataset.get_calib(img_id)]
     decoded = decode_detections(dets, info_np, calibs, dataset.cls_mean_size, threshold=threshold)
-    pred_objects = [pred_row_to_dict(row) for row in decoded.get(img_id, []) if int(row[0]) == dataset.cls2id.get("Car", 1)]
+    return [pred_row_to_dict(row) for row in decoded.get(img_id, []) if int(row[0]) == dataset.cls2id.get("Car", 1)]
+
+
+def get_detection_context(dataset, info):
+    img_id = int(info["img_id"][0].detach().cpu().item())
+    img_name = image_id_name(img_id)
+    img_path = os.path.join(dataset.image_dir, img_name + dataset.image_ext)
+    rgb = cv2.cvtColor(cv2.imread(img_path), cv2.COLOR_BGR2RGB)
+    calib = dataset.get_calib(img_id)
 
     gt_path = os.path.join(dataset.label_dir, img_name + ".txt")
     gt_objects = [
         obj for obj in get_objects_from_label(gt_path)
         if obj.cls_type == "Car" and obj.level_str != "DontCare"
     ]
-    baseline_objects = read_baseline_result(baseline_result_dir, img_id, threshold=threshold)
-    drawn = draw_objects_on_image(rgb, calibs[0], gt_objects, pred_objects, baseline_objects)
+    return img_id, rgb, calib, gt_objects
 
-    fig = plt.figure(figsize=(13, 4.8), dpi=180)
-    ax1 = fig.add_subplot(1, 2, 1)
-    ax1.imshow(drawn)
-    ax1.set_title("Image-view 3D boxes")
-    ax1.axis("off")
-    ax2 = fig.add_subplot(1, 2, 2)
-    draw_bev(ax2, gt_objects, pred_objects, baseline_objects)
-    ax2.set_title("BEV localization")
+
+def render_bev_image(gt_objects, pred_objects, baseline_objects=None,
+                     pred_label="Ours", baseline_label="Baseline",
+                     pred_color="#e53e3e", baseline_color="#3182ce"):
+    fig, ax = plt.subplots(figsize=(4.8, 4.8), dpi=180)
+    draw_bev(ax, gt_objects, pred_objects, baseline_objects,
+             pred_label=pred_label,
+             baseline_label=baseline_label,
+             pred_color=pred_color,
+             baseline_color=baseline_color)
     fig.tight_layout()
-    fig.savefig(out_path, bbox_inches="tight")
+    image = figure_to_rgb(fig)
     plt.close(fig)
+    return image
+
+
+def build_detection_images(dataset, outputs, info, threshold, topk, baseline_result_dir=None,
+                           pred_label="Ours", baseline_label="Baseline",
+                           pred_image_color=(255, 40, 40), baseline_image_color=(30, 130, 255),
+                           pred_bev_color="#e53e3e", baseline_bev_color="#3182ce",
+                           pred_objects_override=None, baseline_objects_override=None):
+    img_id, rgb, calib, gt_objects = get_detection_context(dataset, info)
+    pred_objects = pred_objects_override
+    if pred_objects is None:
+        pred_objects = decode_pred_objects(dataset, outputs, info, threshold, topk)
+    baseline_objects = baseline_objects_override
+    if baseline_objects is None:
+        baseline_objects = read_baseline_result(baseline_result_dir, img_id, threshold=threshold)
+
+    drawn = draw_objects_on_image(
+        rgb, calib, gt_objects, pred_objects, baseline_objects,
+        pred_color=pred_image_color,
+        baseline_color=baseline_image_color)
+    bev_image = render_bev_image(
+        gt_objects, pred_objects, baseline_objects,
+        pred_label=pred_label,
+        baseline_label=baseline_label,
+        pred_color=pred_bev_color,
+        baseline_color=baseline_bev_color)
+    return [drawn, bev_image], ["Image-view 3D boxes", "BEV localization"], pred_objects, gt_objects
+
+
+def make_detection_figure(dataset, inputs, outputs, info, out_path, threshold, topk,
+                          baseline_result_dir=None, panel_mode="combined",
+                          pred_label="Ours",
+                          pred_image_color=(255, 40, 40),
+                          pred_bev_color="#e53e3e"):
+    images, titles, _, _ = build_detection_images(
+        dataset, outputs, info, threshold, topk,
+        baseline_result_dir=baseline_result_dir,
+        pred_label=pred_label,
+        pred_image_color=pred_image_color,
+        pred_bev_color=pred_bev_color)
+    save_figure_outputs(images, titles, out_path, panel_mode=panel_mode, ncols=2)
+
+
+def make_detection_comparison_figure(dataset, info, baseline_outputs, method_outputs,
+                                     out_path, threshold, topk, baseline_name,
+                                     method_name, panel_mode="combined"):
+    baseline_pred = decode_pred_objects(dataset, baseline_outputs, info, threshold, topk)
+    method_pred = decode_pred_objects(dataset, method_outputs, info, threshold, topk)
+    images, titles, _, _ = build_detection_images(
+        dataset, method_outputs, info, threshold, topk,
+        pred_label=method_name,
+        baseline_label=baseline_name,
+        pred_image_color=(255, 40, 40),
+        baseline_image_color=(30, 130, 255),
+        pred_bev_color="#e53e3e",
+        baseline_bev_color="#3182ce",
+        pred_objects_override=method_pred,
+        baseline_objects_override=baseline_pred)
+    save_figure_outputs(images, titles, out_path, panel_mode=panel_mode, ncols=2)
+
+
+def move_to_device(value, device):
+    if torch.is_tensor(value):
+        return value.to(device)
+    if isinstance(value, dict):
+        return {key: move_to_device(val, device) for key, val in value.items()}
+    if isinstance(value, list):
+        return [move_to_device(val, device) for val in value]
+    if isinstance(value, tuple):
+        return tuple(move_to_device(val, device) for val in value)
+    return value
+
+
+def run_model_forward(model, model_type, inputs_gpu, calibs_gpu, target, info, device,
+                      return_visual_debug=False):
+    img_sizes = info["img_size"].to(device)
+    if model_type == "monodgp":
+        target_gpu = move_to_device(target, device)
+        return model(inputs_gpu, calibs_gpu, target_gpu, img_sizes, dn_args=0)
+    return model(
+        inputs_gpu, calibs_gpu, img_sizes,
+        dn_args=0, return_visual_debug=return_visual_debug)
+
+
+def save_response_comparison(inputs, baseline_outputs, method_outputs, out_dir, name,
+                             baseline_name, method_name, panel_mode):
+    baseline_images, titles = build_response_images(inputs, baseline_outputs)
+    method_images, _ = build_response_images(inputs, method_outputs)
+    for idx, title in enumerate(titles, start=1):
+        out_path = Path(out_dir) / f"{name}_{idx:02d}_{slugify(title)}_compare.png"
+        save_side_by_side(
+            [baseline_images[idx - 1], method_images[idx - 1]],
+            [title, title],
+            [baseline_name, method_name],
+            out_path,
+            panel_mode=panel_mode,
+            dpi=180)
 
 
 def sample_matches_filter(dataset, img_id, mode):
@@ -470,7 +672,7 @@ def sample_matches_filter(dataset, img_id, mode):
     return True
 
 
-def plot_ablation_summary(out_path):
+def plot_ablation_summary(out_path, panel_mode="combined"):
     main = {
         "A": [28.62, 21.09, 18.80],
         "B": [29.86, 21.61, 19.47],
@@ -492,12 +694,13 @@ def plot_ablation_summary(out_path):
     }
     series = [("Easy", 0, "#386cb0"), ("Mod.", 1, "#2e8b57"), ("Hard", 2, "#a64e4e")]
 
-    fig, axes = plt.subplots(1, 3, figsize=(15.5, 4.0), dpi=180)
-    for ax, data, title, xlabel in [
-        (axes[0], main, "(a) Main module ablation", "Experiment ID"),
-        (axes[1], proto, "(b) Prototype components", "Component setting"),
-        (axes[2], nums, "(c) Prototype number sensitivity", "Foreground prototypes"),
-    ]:
+    plots = [
+        (main, "(a) Main module ablation", "Experiment ID"),
+        (proto, "(b) Prototype components", "Component setting"),
+        (nums, "(c) Prototype number sensitivity", "Foreground prototypes"),
+    ]
+
+    def draw_ablation_plot(ax, data, title, xlabel, with_legend=False):
         keys = list(data.keys())
         x = np.arange(len(keys))
         for name, idx, color in series:
@@ -508,10 +711,29 @@ def plot_ablation_summary(out_path):
         ax.set_xlabel(xlabel)
         ax.set_ylabel(r"$AP_{3D}$ (%)")
         ax.grid(axis="y", linestyle="--", alpha=0.4)
-    axes[0].legend(loc="lower right", ncol=3, fontsize=8)
-    fig.tight_layout()
-    fig.savefig(out_path, bbox_inches="tight")
-    plt.close(fig)
+        if with_legend:
+            ax.legend(loc="lower right", ncol=3, fontsize=8)
+
+    out_path = Path(out_path)
+    if panel_mode in {"combined", "both"}:
+        ensure_dir(out_path.parent)
+        fig, axes = plt.subplots(1, 3, figsize=(15.5, 4.0), dpi=180)
+        for ax, (data, title, xlabel) in zip(axes, plots):
+            draw_ablation_plot(ax, data, title, xlabel)
+        axes[0].legend(loc="lower right", ncol=3, fontsize=8)
+        fig.tight_layout()
+        fig.savefig(out_path, bbox_inches="tight")
+        plt.close(fig)
+
+    if panel_mode in {"split", "both"}:
+        split_dir = split_dir_for(out_path)
+        ensure_dir(split_dir)
+        for idx, (data, title, xlabel) in enumerate(plots, start=1):
+            fig, ax = plt.subplots(1, 1, figsize=(5.3, 4.0), dpi=180)
+            draw_ablation_plot(ax, data, title, xlabel, with_legend=True)
+            fig.tight_layout()
+            fig.savefig(split_dir / f"{out_path.stem}_{idx:02d}_{slugify(title)}.png", bbox_inches="tight")
+            plt.close(fig)
 
 
 def main():
@@ -521,29 +743,61 @@ def main():
 
     cfg = load_cfg(args.config, args)
     output_dir = Path(args.output_dir)
-    subdirs = {
-        "label": output_dir / "01_label_supervision",
-        "response": output_dir / "02_response_maps",
-        "prototype": output_dir / "03_prototype_relocalization",
-        "detection": output_dir / "04_detection_bev",
-        "ablation": output_dir / "05_ablation_summary",
+    dir_names = {
+        "label": "01_label_supervision",
+        "response": "02_response_maps",
+        "prototype": "03_prototype_relocalization",
+        "detection": "04_detection_bev",
+        "ablation": "05_ablation_summary",
     }
-    for key in make_set:
-        ensure_dir(subdirs[key])
+    compare_mode = args.baseline_checkpoint is not None
 
-    model_needed = bool(make_set & {"label", "response", "prototype", "detection"})
-    if model_needed:
-        import torch
+    if compare_mode:
+        shared_subdirs = {
+            "label": output_dir / "shared" / dir_names["label"],
+            "ablation": output_dir / "shared" / dir_names["ablation"],
+        }
+        model_subdirs = {}
+        for model_name in [args.baseline_name, args.method_name]:
+            model_root = output_dir / safe_dir_name(model_name)
+            model_subdirs[model_name] = {
+                key: model_root / dirname for key, dirname in dir_names.items()
+            }
+        comparison_subdirs = {
+            "response": output_dir / "comparison" / dir_names["response"],
+            "detection": output_dir / "comparison" / dir_names["detection"],
+        }
+        for key in make_set:
+            if key in shared_subdirs:
+                ensure_dir(shared_subdirs[key])
+            if key in comparison_subdirs:
+                ensure_dir(comparison_subdirs[key])
+            for model_name in model_subdirs:
+                if key in {"response", "prototype", "detection"}:
+                    ensure_dir(model_subdirs[model_name][key])
+    else:
+        subdirs = {
+            key: output_dir / dirname for key, dirname in dir_names.items()
+        }
+        for key in make_set:
+            ensure_dir(subdirs[key])
+
+    dataloader_needed = bool(make_set & {"label", "response", "prototype", "detection"})
+    model_needed = bool(make_set & {"response", "prototype", "detection"})
+    if dataloader_needed:
         from lib.helpers.dataloader_helper import build_test_dataloader
 
-        device = torch.device(args.device if torch.cuda.is_available() and args.device.startswith("cuda") else "cpu")
+        device = torch.device(args.device if model_needed and torch.cuda.is_available() and args.device.startswith("cuda") else "cpu")
     else:
         build_test_dataloader = None
         device = None
 
-    if not model_needed:
+    if not dataloader_needed:
         if "ablation" in make_set:
-            plot_ablation_summary(subdirs["ablation"] / "fig_ablation_summary.png")
+            if compare_mode:
+                plot_ablation_summary(shared_subdirs["ablation"] / "fig_ablation_summary.png", panel_mode=args.panel_mode)
+            else:
+                plot_ablation_summary(subdirs["ablation"] / "fig_ablation_summary.png", panel_mode=args.panel_mode)
         print(f"Saved figures to {output_dir}")
         return
 
@@ -551,9 +805,34 @@ def main():
     dataset = dataloader.dataset
 
     if "ablation" in make_set:
-        plot_ablation_summary(subdirs["ablation"] / "fig_ablation_summary.png")
+        if compare_mode:
+            plot_ablation_summary(shared_subdirs["ablation"] / "fig_ablation_summary.png", panel_mode=args.panel_mode)
+        else:
+            plot_ablation_summary(subdirs["ablation"] / "fig_ablation_summary.png", panel_mode=args.panel_mode)
 
-    model = build_and_load_model(cfg, args.checkpoint, device)
+    model_specs = [{
+        "name": args.method_name,
+        "type": args.model_type,
+        "cfg": cfg,
+        "checkpoint": args.checkpoint,
+        "pred_image_color": (255, 40, 40),
+        "pred_bev_color": "#e53e3e",
+    }]
+    if compare_mode:
+        baseline_cfg = load_cfg(args.baseline_config or args.config, args)
+        model_specs.insert(0, {
+            "name": args.baseline_name,
+            "type": args.baseline_model_type,
+            "cfg": baseline_cfg,
+            "checkpoint": args.baseline_checkpoint,
+            "pred_image_color": (30, 130, 255),
+            "pred_bev_color": "#3182ce",
+        })
+
+    if model_needed:
+        for spec in model_specs:
+            spec["model"] = build_and_load_model(spec["cfg"], spec["checkpoint"], device, spec["type"])
+
     sample_ids = parse_id_set(args.sample_ids)
     saved = 0
 
@@ -566,29 +845,73 @@ def main():
             elif not sample_matches_filter(dataset, img_id, args.auto_filter):
                 continue
 
-            inputs_gpu = inputs.to(device)
-            calibs_gpu = calibs.to(device)
-            img_sizes = info["img_size"].to(device)
-            outputs = model(
-                inputs_gpu, calibs_gpu, img_sizes,
-                dn_args=0, return_visual_debug=("prototype" in make_set or "response" in make_set))
-
             name = image_id_name(img_id)
             if "label" in make_set:
-                make_label_supervision_figure(inputs, target, subdirs["label"] / f"{name}_label_supervision.png")
-            if "response" in make_set:
-                make_response_figure(inputs, outputs, subdirs["response"] / f"{name}_response_maps.png")
-            if "prototype" in make_set:
-                ok = make_prototype_figure(inputs, outputs, subdirs["prototype"] / f"{name}_prototype_relocalization.png")
-                if not ok:
-                    print(f"[WARN] prototype debug data is unavailable for {name}")
-            if "detection" in make_set:
-                make_detection_figure(
-                    dataset, inputs, outputs, info,
-                    subdirs["detection"] / f"{name}_detection_bev.png",
-                    threshold=args.threshold,
-                    topk=args.topk,
-                    baseline_result_dir=args.baseline_result_dir)
+                label_dir = shared_subdirs["label"] if compare_mode else subdirs["label"]
+                make_label_supervision_figure(
+                    inputs, target,
+                    label_dir / f"{name}_label_supervision.png",
+                    panel_mode=args.panel_mode)
+
+            outputs_by_name = {}
+            if model_needed:
+                inputs_gpu = inputs.to(device)
+                calibs_gpu = calibs.to(device)
+                for spec in model_specs:
+                    return_debug = spec["type"] == "monoclue" and ("prototype" in make_set or "response" in make_set)
+                    outputs = run_model_forward(
+                        spec["model"], spec["type"],
+                        inputs_gpu, calibs_gpu, target, info, device,
+                        return_visual_debug=return_debug)
+                    outputs_by_name[spec["name"]] = outputs
+
+                    active_subdirs = model_subdirs[spec["name"]] if compare_mode else subdirs
+                    safe_name = safe_dir_name(spec["name"])
+                    if "response" in make_set:
+                        make_response_figure(
+                            inputs, outputs,
+                            active_subdirs["response"] / f"{name}_{safe_name}_response_maps.png",
+                            panel_mode=args.panel_mode)
+                    if "prototype" in make_set:
+                        ok = make_prototype_figure(
+                            inputs, outputs,
+                            active_subdirs["prototype"] / f"{name}_{safe_name}_prototype_relocalization.png",
+                            panel_mode=args.panel_mode)
+                        if not ok:
+                            print(f"[WARN] prototype debug data is unavailable for {name} ({spec['name']})")
+                    if "detection" in make_set:
+                        make_detection_figure(
+                            dataset, inputs, outputs, info,
+                            active_subdirs["detection"] / f"{name}_{safe_name}_detection_bev.png",
+                            threshold=args.threshold,
+                            topk=args.topk,
+                            baseline_result_dir=None if compare_mode else args.baseline_result_dir,
+                            panel_mode=args.panel_mode,
+                            pred_label=spec["name"],
+                            pred_image_color=spec["pred_image_color"],
+                            pred_bev_color=spec["pred_bev_color"])
+
+                if compare_mode and "response" in make_set:
+                    save_response_comparison(
+                        inputs,
+                        outputs_by_name[args.baseline_name],
+                        outputs_by_name[args.method_name],
+                        comparison_subdirs["response"] / name,
+                        name,
+                        args.baseline_name,
+                        args.method_name,
+                        panel_mode=args.panel_mode)
+                if compare_mode and "detection" in make_set:
+                    make_detection_comparison_figure(
+                        dataset, info,
+                        outputs_by_name[args.baseline_name],
+                        outputs_by_name[args.method_name],
+                        comparison_subdirs["detection"] / f"{name}_detection_bev_compare.png",
+                        threshold=args.threshold,
+                        topk=args.topk,
+                        baseline_name=args.baseline_name,
+                        method_name=args.method_name,
+                        panel_mode=args.panel_mode)
 
             saved += 1
             print(f"[{saved}] saved visualizations for {name}")
