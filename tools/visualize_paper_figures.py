@@ -229,6 +229,15 @@ def safe_dir_name(value):
     return value.strip("_") or "model"
 
 
+def display_model_name(value):
+    normalized = re.sub(r"[^a-z0-9]+", "", value.strip().lower())
+    if normalized == "monodgp":
+        return "baseline"
+    if normalized in {"monocluedgp", "monoclue"}:
+        return "ours"
+    return value
+
+
 def save_rgb_image(image, out_path):
     ensure_dir(Path(out_path).parent)
     image = np.asarray(image)
@@ -520,7 +529,7 @@ def read_baseline_result(result_dir, img_id, class_name="Car", threshold=0.0):
 
 
 def draw_bev(ax, gt_objects, pred_objects, baseline_objects=None,
-             pred_label="Ours", baseline_label="Baseline",
+             pred_label="ours", baseline_label="baseline",
              pred_color="#e53e3e", baseline_color="#3182ce"):
     def draw_corners(corners, color, label=None, lw=1.8):
         pts = corners[:4, [0, 2]]
@@ -578,7 +587,7 @@ def get_detection_context(dataset, info):
 
 
 def render_bev_image(gt_objects, pred_objects, baseline_objects=None,
-                     pred_label="Ours", baseline_label="Baseline",
+                     pred_label="ours", baseline_label="baseline",
                      pred_color="#e53e3e", baseline_color="#3182ce"):
     fig, ax = plt.subplots(figsize=(4.8, 4.8), dpi=180)
     draw_bev(ax, gt_objects, pred_objects, baseline_objects,
@@ -593,7 +602,7 @@ def render_bev_image(gt_objects, pred_objects, baseline_objects=None,
 
 
 def build_detection_images(dataset, outputs, info, threshold, topk, baseline_result_dir=None,
-                           pred_label="Ours", baseline_label="Baseline",
+                           pred_label="ours", baseline_label="baseline",
                            pred_image_color=(255, 40, 40), baseline_image_color=(30, 130, 255),
                            pred_bev_color="#e53e3e", baseline_bev_color="#3182ce",
                            pred_objects_override=None, baseline_objects_override=None):
@@ -620,7 +629,7 @@ def build_detection_images(dataset, outputs, info, threshold, topk, baseline_res
 
 def make_detection_figure(dataset, inputs, outputs, info, out_path, threshold, topk,
                           baseline_result_dir=None, panel_mode="combined",
-                          pred_label="Ours",
+                          pred_label="ours",
                           pred_image_color=(255, 40, 40),
                           pred_bev_color="#e53e3e"):
     images, titles, _, _ = build_detection_images(
@@ -845,6 +854,7 @@ def main():
 
     model_specs = [{
         "name": args.method_name,
+        "display_name": display_model_name(args.method_name),
         "type": args.model_type,
         "cfg": cfg,
         "checkpoint": args.checkpoint,
@@ -855,6 +865,7 @@ def main():
         baseline_cfg = load_cfg(args.baseline_config or args.config, args)
         model_specs.insert(0, {
             "name": args.baseline_name,
+            "display_name": display_model_name(args.baseline_name),
             "type": args.baseline_model_type,
             "cfg": baseline_cfg,
             "checkpoint": args.baseline_checkpoint,
@@ -920,7 +931,7 @@ def main():
                             topk=args.topk,
                             baseline_result_dir=None if compare_mode else args.baseline_result_dir,
                             panel_mode=args.panel_mode,
-                            pred_label=spec["name"],
+                            pred_label=spec["display_name"],
                             pred_image_color=spec["pred_image_color"],
                             pred_bev_color=spec["pred_bev_color"])
 
@@ -931,8 +942,8 @@ def main():
                         outputs_by_name[args.method_name],
                         comparison_subdirs["response"] / name,
                         name,
-                        args.baseline_name,
-                        args.method_name,
+                        display_model_name(args.baseline_name),
+                        display_model_name(args.method_name),
                         panel_mode=args.panel_mode)
                 if compare_mode and "detection" in make_set:
                     make_detection_comparison_figure(
@@ -942,8 +953,8 @@ def main():
                         comparison_subdirs["detection"] / f"{name}_detection_bev_compare.png",
                         threshold=args.threshold,
                         topk=args.topk,
-                        baseline_name=args.baseline_name,
-                        method_name=args.method_name,
+                        baseline_name=display_model_name(args.baseline_name),
+                        method_name=display_model_name(args.method_name),
                         panel_mode=args.panel_mode)
 
             saved += 1
