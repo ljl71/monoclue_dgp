@@ -371,18 +371,31 @@ def draw_projected_box3d(image, qs, color=(255, 255, 255), thickness=2):
           |/         |/
           6 -------- 7
     '''
-    qs = qs.astype(np.int32)
-    for k in range(0, 4):
-        # Ref: http://docs.enthought.com/mayavi/mayavi/auto/mlab_helper_functions.html
-        i, j = k, (k + 1) % 4
-        # use LINE_AA for opencv3
-        cv2.line(image, (qs[i, 0], qs[i, 1]), (qs[j, 0], qs[j, 1]), color, thickness, cv2.LINE_AA)
+    qs = np.asarray(qs, dtype=np.float32)
+    if qs.shape[0] != 8 or qs.shape[1] < 2 or not np.isfinite(qs[:, :2]).all():
+        return image
 
-        i, j = k + 4, (k + 1) % 4 + 4
-        cv2.line(image, (qs[i, 0], qs[i, 1]), (qs[j, 0], qs[j, 1]), color, thickness, cv2.LINE_AA)
-
-        i, j = k, k + 4
-        cv2.line(image, (qs[i, 0], qs[i, 1]), (qs[j, 0], qs[j, 1]), color, thickness, cv2.LINE_AA)
+    h, w = image.shape[:2]
+    pad = max(h, w) * 0.10
+    in_padded_image = (
+        (qs[:, 0] >= -pad) & (qs[:, 0] <= w + pad) &
+        (qs[:, 1] >= -pad) & (qs[:, 1] <= h + pad)
+    )
+    max_edge_len = np.hypot(w, h) * 0.75
+    rect = (0, 0, w, h)
+    edges = [(0, 1), (1, 2), (2, 3), (3, 0),
+             (4, 5), (5, 6), (6, 7), (7, 4),
+             (0, 4), (1, 5), (2, 6), (3, 7)]
+    for i, j in edges:
+        if not (in_padded_image[i] and in_padded_image[j]):
+            continue
+        if np.linalg.norm(qs[i, :2] - qs[j, :2]) > max_edge_len:
+            continue
+        p1 = tuple(np.round(qs[i, :2]).astype(np.int32))
+        p2 = tuple(np.round(qs[j, :2]).astype(np.int32))
+        ok, p1, p2 = cv2.clipLine(rect, p1, p2)
+        if ok:
+            cv2.line(image, p1, p2, color, thickness, cv2.LINE_AA)
     return image
 
 

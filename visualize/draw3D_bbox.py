@@ -132,6 +132,8 @@ def main(args):
                 *df_gt.loc[i, ['height', 'width', 'length',
                                'pos_x', 'pos_y', 'pos_z', 'rot_y']]
             )
+            if np.any(corners_3d_cam2[2, :] <= 0.1):
+                continue
             pts_2d = calib.project_rect_to_image(corners_3d_cam2.T)
             image = draw_projected_box3d(
                 image, pts_2d,
@@ -145,6 +147,8 @@ def main(args):
                 *df_pred.loc[q, ['height', 'width', 'length',
                                   'pos_x', 'pos_y', 'pos_z', 'rot_y']]
             )
+            if np.any(corners_3d_cam2[2, :] <= 0.1):
+                continue
             pts_2d = calib.project_rect_to_image(corners_3d_cam2.T)
             save_img = draw_projected_box3d(
                 save_img, pts_2d,

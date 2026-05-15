@@ -464,12 +464,45 @@ def compute_3d_corners(h, w, l, x, y, z, yaw):
     return corners.T
 
 
-def draw_projected_box(image, pts, color, thickness=2):
-    pts = np.asarray(pts, dtype=np.int32)
+def project_box_corners(calib, corners):
+    if hasattr(calib, "rect_to_img"):
+        pts, depth = calib.rect_to_img(corners)
+    else:
+        pts = calib.project_rect_to_image(corners)
+        depth = corners[:, 2]
+    return np.asarray(pts, dtype=np.float32), np.asarray(depth, dtype=np.float32)
+
+
+def draw_projected_box(image, pts, color, thickness=2, depth=None,
+                       min_depth=0.1, pad_ratio=0.10, max_edge_ratio=0.75):
+    pts = np.asarray(pts, dtype=np.float32)
+    if pts.shape != (8, 2) or not np.isfinite(pts).all():
+        return image
+    if depth is not None:
+        depth = np.asarray(depth, dtype=np.float32)
+        if depth.shape[0] != 8 or np.any(depth <= min_depth):
+            return image
+
+    h, w = image.shape[:2]
+    pad = max(h, w) * pad_ratio
+    in_padded_image = (
+        (pts[:, 0] >= -pad) & (pts[:, 0] <= w + pad) &
+        (pts[:, 1] >= -pad) & (pts[:, 1] <= h + pad)
+    )
+    max_edge_len = np.hypot(w, h) * max_edge_ratio
     edges = [(0, 1), (1, 2), (2, 3), (3, 0), (4, 5), (5, 6), (6, 7), (7, 4),
              (0, 4), (1, 5), (2, 6), (3, 7)]
+    rect = (0, 0, w, h)
     for i, j in edges:
-        cv2.line(image, tuple(pts[i]), tuple(pts[j]), color, thickness, lineType=cv2.LINE_AA)
+        if not (in_padded_image[i] and in_padded_image[j]):
+            continue
+        if np.linalg.norm(pts[i] - pts[j]) > max_edge_len:
+            continue
+        p1 = tuple(np.round(pts[i]).astype(np.int32))
+        p2 = tuple(np.round(pts[j]).astype(np.int32))
+        ok, p1, p2 = cv2.clipLine(rect, p1, p2)
+        if ok:
+            cv2.line(image, p1, p2, color, thickness, lineType=cv2.LINE_AA)
     return image
 
 
@@ -478,17 +511,17 @@ def draw_objects_on_image(rgb, calib, gt_objects, pred_objects, baseline_objects
     out = rgb.copy()
     for obj in gt_objects:
         corners = obj.generate_corners3d()
-        pts = calib.rect_to_img(corners)[0] if hasattr(calib, "rect_to_img") else calib.project_rect_to_image(corners)
-        out = draw_projected_box(out, pts, (60, 220, 60), 2)
+        pts, depth = project_box_corners(calib, corners)
+        out = draw_projected_box(out, pts, (60, 220, 60), 2, depth=depth)
     if baseline_objects:
         for pred in baseline_objects:
             corners = compute_3d_corners(*pred["dims"], *pred["loc"], pred["ry"])
-            pts = calib.rect_to_img(corners)[0] if hasattr(calib, "rect_to_img") else calib.project_rect_to_image(corners)
-            out = draw_projected_box(out, pts, baseline_color, 2)
+            pts, depth = project_box_corners(calib, corners)
+            out = draw_projected_box(out, pts, baseline_color, 2, depth=depth)
     for pred in pred_objects:
         corners = compute_3d_corners(*pred["dims"], *pred["loc"], pred["ry"])
-        pts = calib.rect_to_img(corners)[0] if hasattr(calib, "rect_to_img") else calib.project_rect_to_image(corners)
-        out = draw_projected_box(out, pts, pred_color, 2)
+        pts, depth = project_box_corners(calib, corners)
+        out = draw_projected_box(out, pts, pred_color, 2, depth=depth)
     return out
 
 
