@@ -211,6 +211,16 @@ def colorize_heat(arr, valid=None, cmap_name="magma"):
     return colored
 
 
+def foreground_weighted_inverse_depth(weighted_depth, region_prob, fg_threshold=0.35):
+    valid_depth = np.isfinite(weighted_depth) & (weighted_depth > 0)
+    inverse_depth = 1.0 - normalize_map(weighted_depth, valid=valid_depth)
+    inverse_depth[~valid_depth] = 0.0
+    fg_weight = normalize_map(region_prob)
+    response = inverse_depth * fg_weight
+    valid_response = valid_depth & (region_prob > fg_threshold)
+    return response, valid_response
+
+
 def overlay_mask(rgb, mask, color=(255, 80, 30), alpha=0.42):
     out = rgb.copy()
     mask = mask.astype(bool)
@@ -374,16 +384,16 @@ def build_response_images(inputs, outputs):
         depth_values = torch.arange(logits.shape[1], device=logits.device, dtype=logits.dtype)
         weighted_depth = (depth_probs * depth_values.view(1, -1, 1, 1)).sum(1)[0].detach().cpu().numpy()
     weighted_depth = resize_float_map(weighted_depth, hw)
-    fg_depth = weighted_depth * normalize_map(region_prob)
+    fg_inverse_depth, fg_inverse_depth_valid = foreground_weighted_inverse_depth(weighted_depth, region_prob)
 
     images = [
         rgb,
         colorize_heat(region_prob, cmap_name="viridis"),
         colorize_heat(weighted_depth, valid=weighted_depth > 0, cmap_name="magma"),
-        colorize_heat(fg_depth, valid=region_prob > 0.35, cmap_name="magma"),
+        colorize_heat(fg_inverse_depth, valid=fg_inverse_depth_valid, cmap_name="magma"),
         overlay_mask(rgb, region_prob > 0.5, color=(30, 180, 90)),
     ]
-    titles = ["Input", "Predicted foreground", "Predicted depth response", "Foreground-weighted depth", "Foreground overlay"]
+    titles = ["Input", "Predicted foreground", "Predicted depth response", "Foreground-weighted inverse depth", "Foreground overlay"]
     return images, titles
 
 
@@ -433,12 +443,12 @@ def build_prototype_images(inputs, outputs):
 
     images = [
         rgb,
-        colorize_heat(region_prob, cmap_name="viridis"),
+        overlay_mask(rgb, region_prob > 0.5, color=(30, 180, 90), alpha=0.45),
         fg_overlay.astype(np.uint8),
         bg_overlay,
         colorize_heat(corr_map, cmap_name="inferno"),
     ]
-    titles = ["Input", "High-confidence foreground", "Foreground prototypes", "Effective background prototypes", "Prototype similarity"]
+    titles = ["Input", "High-confidence foreground mask", "Foreground prototypes", "Effective background prototypes", "Prototype similarity"]
     return images, titles
 
 
