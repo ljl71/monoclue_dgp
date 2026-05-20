@@ -79,9 +79,11 @@ def parse_args():
     parser.add_argument("--baseline-result-dir", default=None,
                         help="Optional KITTI-format baseline results folder, e.g. MonoDGP outputs/data.")
     parser.add_argument("--make", default="all",
-                        help="Comma-separated: all,label,response,prototype,detection,ablation.")
+                        help="Comma-separated: all,label,response,prototype,detection,depth,ablation.")
     parser.add_argument("--panel-mode", default="combined", choices=["combined", "split", "both"],
                         help="combined: old multi-panel figures; split: each panel as an image; both: save both.")
+    parser.add_argument("--detection-views", default="2d,3d,bev",
+                        help="Comma-separated detection panels to save: 2d,3d,bev.")
     return parser.parse_args()
 
 
@@ -99,6 +101,26 @@ def parse_id_set(value):
             continue
         ids.append(int(item))
     return set(ids)
+
+
+def parse_detection_views(value):
+    views = [item.strip().lower() for item in value.split(",") if item.strip()]
+    aliases = {
+        "2d": "2d",
+        "bbox": "2d",
+        "box2d": "2d",
+        "3d": "3d",
+        "image3d": "3d",
+        "bev": "bev",
+    }
+    parsed = []
+    for view in views:
+        if view not in aliases:
+            raise ValueError(f"Unsupported detection view: {view}. Use 2d, 3d, bev.")
+        canonical = aliases[view]
+        if canonical not in parsed:
+            parsed.append(canonical)
+    return parsed or ["2d", "3d", "bev"]
 
 
 def image_id_name(img_id):
@@ -211,6 +233,18 @@ def colorize_heat(arr, valid=None, cmap_name="magma"):
     return colored
 
 
+def depth_bin_values_from_cfg(model_cfg, num_channels):
+    num_bins = int(model_cfg.get("num_depth_bins", num_channels - 1))
+    depth_min = float(model_cfg.get("depth_min", 1e-3))
+    depth_max = float(model_cfg.get("depth_max", num_bins))
+    if num_bins + 1 != num_channels:
+        return np.arange(num_channels, dtype=np.float32)
+    bin_size = 2 * (depth_max - depth_min) / (num_bins * (1 + num_bins))
+    bin_index = np.linspace(0, num_bins - 1, num_bins, dtype=np.float32)
+    bin_values = (bin_index + 0.5) ** 2 * bin_size / 2 - bin_size / 8 + depth_min
+    return np.concatenate([bin_values, np.array([depth_max], dtype=np.float32)]).astype(np.float32)
+
+
 def foreground_weighted_inverse_depth(weighted_depth, region_prob, fg_threshold=0.35):
     valid_depth = np.isfinite(weighted_depth) & (weighted_depth > 0)
     inverse_depth = 1.0 - normalize_map(weighted_depth, valid=valid_depth)
@@ -219,6 +253,17 @@ def foreground_weighted_inverse_depth(weighted_depth, region_prob, fg_threshold=
     response = inverse_depth * fg_weight
     valid_response = valid_depth & (region_prob > fg_threshold)
     return response, valid_response
+
+
+def draw_crosshair(image, x, y, color=(255, 255, 255)):
+    out = image.copy()
+    h, w = out.shape[:2]
+    x = int(np.clip(round(x), 0, w - 1))
+    y = int(np.clip(round(y), 0, h - 1))
+    cv2.circle(out, (x, y), 7, color, 2, lineType=cv2.LINE_AA)
+    cv2.line(out, (max(0, x - 12), y), (min(w - 1, x + 12), y), color, 2, lineType=cv2.LINE_AA)
+    cv2.line(out, (x, max(0, y - 12)), (x, min(h - 1, y + 12)), color, 2, lineType=cv2.LINE_AA)
+    return out
 
 
 def overlay_mask(rgb, mask, color=(255, 80, 30), alpha=0.42):
@@ -402,6 +447,97 @@ def make_response_figure(inputs, outputs, out_path, panel_mode="combined"):
     save_figure_outputs(images, titles, out_path, panel_mode=panel_mode)
 
 
+def weighted_depth_from_outputs(outputs, depth_values):
+    debug_depth = outputs.get("visual_debug", {}).get("weighted_depth", None)
+    if debug_depth is not None:
+        return debug_depth[0].detach().cpu().numpy().astype(np.float32)
+    logits = outputs["pred_depth_map_logits"]
+    values = torch.as_tensor(depth_values, device=logits.device, dtype=logits.dtype)
+    depth_probs = torch.softmax(logits, dim=1)
+    weighted_depth = (depth_probs * values.view(1, -1, 1, 1)).sum(dim=1)
+    return weighted_depth[0].detach().cpu().numpy().astype(np.float32)
+
+
+def select_depth_logit_pixel(outputs):
+    logits = outputs["pred_depth_map_logits"]
+    probs = torch.softmax(logits, dim=1)[0].detach().cpu().numpy()
+    confidence = probs.max(axis=0)
+
+    if "pred_region_prob" in outputs:
+        region_prob = outputs["pred_region_prob"][0][0, 0].detach().cpu().numpy()
+        region_prob = resize_float_map(region_prob, confidence.shape)
+        score_map = normalize_map(region_prob) * confidence
+    else:
+        score_map = confidence
+
+    y, x = np.unravel_index(np.argmax(score_map), score_map.shape)
+    return int(x), int(y), probs[:, y, x], confidence
+
+
+def render_depth_distribution(depth_values, probs, weighted_depth):
+    fig, ax = plt.subplots(figsize=(4.2, 2.35), dpi=180)
+    depth_values = np.asarray(depth_values, dtype=np.float32)
+    probs = np.asarray(probs, dtype=np.float32)
+    if len(depth_values) > 1:
+        width = float(np.median(np.diff(depth_values))) * 0.82
+        width = max(width, 0.12)
+    else:
+        width = 0.5
+    ax.bar(depth_values, probs, width=width, color="#2563eb", edgecolor="#1e40af", linewidth=0.25)
+    ax.axvline(float(weighted_depth), color="#dc2626", linewidth=1.8, label="soft-argmin")
+    ax.set_xlim(max(0.0, depth_values.min() - 1.0), depth_values.max() + 1.0)
+    ax.set_ylim(0.0, max(float(probs.max()) * 1.18, 1e-3))
+    ax.set_xlabel("depth / m", fontsize=9)
+    ax.set_ylabel("prob.", fontsize=9)
+    ax.tick_params(axis="both", labelsize=8)
+    ax.grid(axis="y", linestyle="--", alpha=0.32, linewidth=0.5)
+    ax.legend(loc="upper right", fontsize=7, frameon=False)
+    fig.tight_layout(pad=0.35)
+    image = figure_to_rgb(fig)
+    plt.close(fig)
+    return image
+
+
+def build_depth_predictor_output_images(inputs, outputs, model_cfg):
+    rgb = tensor_image_to_rgb(inputs[0])
+    hw = rgb.shape[:2]
+    logits = outputs["pred_depth_map_logits"]
+    depth_values = depth_bin_values_from_cfg(model_cfg, logits.shape[1])
+    x_logit, y_logit, point_probs, confidence = select_depth_logit_pixel(outputs)
+
+    weighted_depth = weighted_depth_from_outputs(outputs, depth_values)
+    selected_depth = weighted_depth[y_logit, x_logit]
+    marker_x = (x_logit + 0.5) * hw[1] / logits.shape[-1]
+    marker_y = (y_logit + 0.5) * hw[0] / logits.shape[-2]
+
+    region_prob = outputs["pred_region_prob"][0][0, 0].detach().cpu().numpy()
+    region_prob = resize_float_map(region_prob, hw)
+    confidence_map = resize_float_map(confidence, hw)
+    weighted_depth_vis = resize_float_map(weighted_depth, hw)
+
+    images = [
+        draw_crosshair(rgb, marker_x, marker_y, color=(255, 255, 255)),
+        draw_crosshair(colorize_heat(region_prob, cmap_name="viridis"), marker_x, marker_y),
+        draw_crosshair(colorize_heat(confidence_map, cmap_name="plasma"), marker_x, marker_y),
+        render_depth_distribution(depth_values, point_probs, selected_depth),
+        draw_crosshair(colorize_heat(weighted_depth_vis, valid=weighted_depth_vis > 0, cmap_name="turbo"),
+                       marker_x, marker_y),
+    ]
+    titles = [
+        "Input and sampled point",
+        "Predicted foreground response",
+        "Depth-logit confidence",
+        "Depth-bin distribution",
+        "Weighted depth soft-argmin",
+    ]
+    return images, titles
+
+
+def make_depth_predictor_output_figure(inputs, outputs, model_cfg, out_path, panel_mode="combined"):
+    images, titles = build_depth_predictor_output_images(inputs, outputs, model_cfg)
+    save_figure_outputs(images, titles, out_path, panel_mode=panel_mode)
+
+
 def corr_to_map(corr, spatial_shape):
     corr = np.asarray(corr)
     if corr.ndim == 3:
@@ -535,6 +671,44 @@ def draw_objects_on_image(rgb, calib, gt_objects, pred_objects, baseline_objects
     return out
 
 
+def draw_2d_box(image, bbox, color, thickness=2, label=None):
+    h, w = image.shape[:2]
+    x1, y1, x2, y2 = np.round(np.asarray(bbox, dtype=np.float32)).astype(np.int32)
+    x1, x2 = np.clip([x1, x2], 0, w - 1)
+    y1, y2 = np.clip([y1, y2], 0, h - 1)
+    if x2 <= x1 or y2 <= y1:
+        return image
+
+    cv2.rectangle(image, (x1, y1), (x2, y2), color, thickness, lineType=cv2.LINE_AA)
+    if label:
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        scale = 0.45
+        text_size, baseline = cv2.getTextSize(label, font, scale, 1)
+        text_w, text_h = text_size
+        top = max(0, y1 - text_h - baseline - 3)
+        cv2.rectangle(image, (x1, top), (min(w - 1, x1 + text_w + 4), y1), color, -1)
+        cv2.putText(image, label, (x1 + 2, y1 - baseline - 2),
+                    font, scale, (255, 255, 255), 1, lineType=cv2.LINE_AA)
+    return image
+
+
+def draw_objects_2d_on_image(rgb, gt_objects, pred_objects, baseline_objects=None,
+                             pred_color=(255, 40, 40), baseline_color=(30, 130, 255)):
+    out = rgb.copy()
+    for obj in gt_objects:
+        out = draw_2d_box(out, obj.box2d, (60, 220, 60), thickness=2, label="GT")
+    if baseline_objects:
+        for pred in baseline_objects:
+            if "bbox" not in pred:
+                continue
+            label = f"B {pred['score']:.2f}" if "score" in pred else "B"
+            out = draw_2d_box(out, pred["bbox"], baseline_color, thickness=2, label=label)
+    for pred in pred_objects:
+        label = f"{pred['score']:.2f}" if "score" in pred else None
+        out = draw_2d_box(out, pred["bbox"], pred_color, thickness=2, label=label)
+    return out
+
+
 def pred_row_to_dict(row):
     return {
         "cls_id": int(row[0]),
@@ -563,6 +737,7 @@ def read_baseline_result(result_dir, img_id, class_name="Car", threshold=0.0):
             if score < threshold:
                 continue
             preds.append({
+                "bbox": [float(parts[4]), float(parts[5]), float(parts[6]), float(parts[7])],
                 "dims": [float(parts[8]), float(parts[9]), float(parts[10])],
                 "loc": [float(parts[11]), float(parts[12]), float(parts[13])],
                 "ry": float(parts[14]),
@@ -648,7 +823,8 @@ def build_detection_images(dataset, outputs, info, threshold, topk, baseline_res
                            pred_label="ours", baseline_label="baseline",
                            pred_image_color=(255, 40, 40), baseline_image_color=(30, 130, 255),
                            pred_bev_color="#e53e3e", baseline_bev_color="#3182ce",
-                           pred_objects_override=None, baseline_objects_override=None):
+                           pred_objects_override=None, baseline_objects_override=None,
+                           detection_views=None):
     img_id, rgb, calib, gt_objects = get_detection_context(dataset, info)
     pred_objects = pred_objects_override
     if pred_objects is None:
@@ -657,36 +833,51 @@ def build_detection_images(dataset, outputs, info, threshold, topk, baseline_res
     if baseline_objects is None:
         baseline_objects = read_baseline_result(baseline_result_dir, img_id, threshold=threshold)
 
-    drawn = draw_objects_on_image(
-        rgb, calib, gt_objects, pred_objects, baseline_objects,
-        pred_color=pred_image_color,
-        baseline_color=baseline_image_color)
-    bev_image = render_bev_image(
-        gt_objects, pred_objects, baseline_objects,
-        pred_label=pred_label,
-        baseline_label=baseline_label,
-        pred_color=pred_bev_color,
-        baseline_color=baseline_bev_color)
-    return [drawn, bev_image], ["Image-view 3D boxes", "BEV localization"], pred_objects, gt_objects
+    detection_views = detection_views or ["2d", "3d", "bev"]
+    images, titles = [], []
+    if "2d" in detection_views:
+        images.append(draw_objects_2d_on_image(
+            rgb, gt_objects, pred_objects, baseline_objects,
+            pred_color=pred_image_color,
+            baseline_color=baseline_image_color))
+        titles.append("Image-view 2D boxes")
+    if "3d" in detection_views:
+        images.append(draw_objects_on_image(
+            rgb, calib, gt_objects, pred_objects, baseline_objects,
+            pred_color=pred_image_color,
+            baseline_color=baseline_image_color))
+        titles.append("Image-view 3D boxes")
+    if "bev" in detection_views:
+        images.append(render_bev_image(
+            gt_objects, pred_objects, baseline_objects,
+            pred_label=pred_label,
+            baseline_label=baseline_label,
+            pred_color=pred_bev_color,
+            baseline_color=baseline_bev_color))
+        titles.append("BEV localization")
+    return images, titles, pred_objects, gt_objects
 
 
 def make_detection_figure(dataset, inputs, outputs, info, out_path, threshold, topk,
                           baseline_result_dir=None, panel_mode="combined",
                           pred_label="ours",
                           pred_image_color=(255, 40, 40),
-                          pred_bev_color="#e53e3e"):
+                          pred_bev_color="#e53e3e",
+                          detection_views=None):
     images, titles, _, _ = build_detection_images(
         dataset, outputs, info, threshold, topk,
         baseline_result_dir=baseline_result_dir,
         pred_label=pred_label,
         pred_image_color=pred_image_color,
-        pred_bev_color=pred_bev_color)
-    save_figure_outputs(images, titles, out_path, panel_mode=panel_mode, ncols=2)
+        pred_bev_color=pred_bev_color,
+        detection_views=detection_views)
+    save_figure_outputs(images, titles, out_path, panel_mode=panel_mode, ncols=max(1, len(images)))
 
 
 def make_detection_comparison_figure(dataset, info, baseline_outputs, method_outputs,
                                      out_path, threshold, topk, baseline_name,
-                                     method_name, panel_mode="combined"):
+                                     method_name, panel_mode="combined",
+                                     detection_views=None):
     baseline_pred = decode_pred_objects(dataset, baseline_outputs, info, threshold, topk)
     method_pred = decode_pred_objects(dataset, method_outputs, info, threshold, topk)
     images, titles, _, _ = build_detection_images(
@@ -698,8 +889,9 @@ def make_detection_comparison_figure(dataset, info, baseline_outputs, method_out
         pred_bev_color="#e53e3e",
         baseline_bev_color="#3182ce",
         pred_objects_override=method_pred,
-        baseline_objects_override=baseline_pred)
-    save_figure_outputs(images, titles, out_path, panel_mode=panel_mode, ncols=2)
+        baseline_objects_override=baseline_pred,
+        detection_views=detection_views)
+    save_figure_outputs(images, titles, out_path, panel_mode=panel_mode, ncols=max(1, len(images)))
 
 
 def move_to_device(value, device):
@@ -823,8 +1015,9 @@ def plot_ablation_summary(out_path, panel_mode="combined"):
 
 def main():
     args = parse_args()
-    make_set = set(["label", "response", "prototype", "detection", "ablation"]
+    make_set = set(["label", "response", "prototype", "detection", "depth", "ablation"]
                    if args.make == "all" else [x.strip() for x in args.make.split(",") if x.strip()])
+    detection_views = parse_detection_views(args.detection_views)
 
     cfg = load_cfg(args.config, args)
     output_dir = Path(args.output_dir)
@@ -833,6 +1026,7 @@ def main():
         "response": "02_response_maps",
         "prototype": "03_prototype_relocalization",
         "detection": "04_detection_bev",
+        "depth": "06_depth_predictor_outputs",
         "ablation": "05_ablation_summary",
     }
     compare_mode = args.baseline_checkpoint is not None
@@ -858,7 +1052,7 @@ def main():
             if key in comparison_subdirs:
                 ensure_dir(comparison_subdirs[key])
             for model_name in model_subdirs:
-                if key in {"response", "prototype", "detection"}:
+                if key in {"response", "prototype", "detection", "depth"}:
                     ensure_dir(model_subdirs[model_name][key])
     else:
         subdirs = {
@@ -867,8 +1061,8 @@ def main():
         for key in make_set:
             ensure_dir(subdirs[key])
 
-    dataloader_needed = bool(make_set & {"label", "response", "prototype", "detection"})
-    model_needed = bool(make_set & {"response", "prototype", "detection"})
+    dataloader_needed = bool(make_set & {"label", "response", "prototype", "detection", "depth"})
+    model_needed = bool(make_set & {"response", "prototype", "detection", "depth"})
     if dataloader_needed:
         from lib.helpers.dataloader_helper import build_test_dataloader
 
@@ -945,7 +1139,7 @@ def main():
                 inputs_gpu = inputs.to(device)
                 calibs_gpu = calibs.to(device)
                 for spec in model_specs:
-                    return_debug = spec["type"] == "monoclue" and ("prototype" in make_set or "response" in make_set)
+                    return_debug = spec["type"] == "monoclue" and bool(make_set & {"prototype", "response", "depth"})
                     outputs = run_model_forward(
                         spec["model"], spec["type"],
                         inputs_gpu, calibs_gpu, target, info, device,
@@ -966,6 +1160,11 @@ def main():
                             panel_mode=args.panel_mode)
                         if not ok:
                             print(f"[WARN] prototype debug data is unavailable for {name} ({spec['name']})")
+                    if "depth" in make_set:
+                        make_depth_predictor_output_figure(
+                            inputs, outputs, spec["cfg"]["model"],
+                            active_subdirs["depth"] / f"{name}_{safe_name}_depth_predictor_outputs.png",
+                            panel_mode=args.panel_mode)
                     if "detection" in make_set:
                         make_detection_figure(
                             dataset, inputs, outputs, info,
@@ -976,7 +1175,8 @@ def main():
                             panel_mode=args.panel_mode,
                             pred_label=spec["display_name"],
                             pred_image_color=spec["pred_image_color"],
-                            pred_bev_color=spec["pred_bev_color"])
+                            pred_bev_color=spec["pred_bev_color"],
+                            detection_views=detection_views)
 
                 if compare_mode and "response" in make_set:
                     save_response_comparison(
@@ -998,7 +1198,8 @@ def main():
                         topk=args.topk,
                         baseline_name=display_model_name(args.baseline_name),
                         method_name=display_model_name(args.method_name),
-                        panel_mode=args.panel_mode)
+                        panel_mode=args.panel_mode,
+                        detection_views=detection_views)
 
             saved += 1
             print(f"[{saved}] saved visualizations for {name}")
